@@ -40,8 +40,7 @@ from jax import lax
 from jax import random
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
-if jax.__version__ >= '0.4.16':
-  from jax.experimental.pallas.ops.tpu import flash_attention
+from jax.experimental.pallas.ops.tpu import flash_attention
 
 
 
@@ -332,6 +331,8 @@ class MultiHeadDotProductAttention(nn.Module):
     """ Apply Attention
     """
     if enable_flash_attention:
+      query = LayerNorm(dtype=self.dtype, name='query_layer_norm', kernel_axes = ('heads',))(query)
+      key = LayerNorm(dtype=self.dtype, name='key_layer_norm', kernel_axes = ('heads',))(key)
       # reshaped to ('batch', 'heads', 'length', 'kv')
       query = jax.numpy.transpose(query, axes = (0,2,1,3))
       key = jax.numpy.transpose(key, axes = (0,2,1,3))
@@ -340,28 +341,31 @@ class MultiHeadDotProductAttention(nn.Module):
           P(('data','fsdp'),'tensor'),
           P(('data','fsdp'),'tensor'),
           P(('data','fsdp'),'tensor'),
+          P(('data','fsdp'),'tensor'),
       ), out_specs = P(('data','fsdp'),'tensor'), check_rep=False)
-      def wrap_flash_attention(query, key, value):
+      def wrap_flash_attention(query, key, value, attention_bias):
         return flash_attention.flash_attention(
               query,
               key,
               value,
-              causal = False,
+              causal = True,
+              ab = attention_bias,
               block_sizes = flash_attention.BlockSizes(
-                  block_q=512,
-                  block_k_major=512,
-                  block_k=512,
-                  block_b=1,
-                  block_q_major_dkv=512,
-                  block_k_major_dkv=512,
-                  block_k_dkv=512,
-                  block_q_dkv=512,
-                  block_k_major_dq=512,
-                  block_k_dq=512,
-                  block_q_dq=512,
+                block_q=512,
+                block_k_major=512,
+                block_k=512,
+                block_b=2,
+                block_q_major_dkv=512,
+                block_k_major_dkv=512,
+                block_q_dkv=512,
+                block_k_dkv=512,
+                block_q_dq=1024,
+                block_k_dq=256,
+                block_k_major_dq=512,
+
               )
             )
-      x = wrap_flash_attention(query, key, value)
+      x = wrap_flash_attention(query, key, value, attention_bias)
       x = jax.numpy.transpose(x, axes = (0,2,1,3))
     else:
       aqt_rng = self.make_rng('aqt')
