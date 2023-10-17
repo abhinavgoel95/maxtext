@@ -53,7 +53,7 @@ def deactivate_profiler(config):
     jax.profiler.stop_trace()
 
 def _prepare_metrics_for_json(metrics, step, run_name):
-  """Converts metric dictionary into json supported types (e.g. float)""" 
+  """Converts metric dictionary into json supported types (e.g. float)"""
   metrics_dict = {}
   for val in metrics['scalar']:
     metrics_dict[val] = float(metrics['scalar'][val])
@@ -158,7 +158,21 @@ def unbox_logicallypartioned_trainstate(
         else x, boxed_train_state, \
         is_leaf=lambda k: isinstance(k, flax.linen.spmd.LogicallyPartitioned))
 
-def init_train_state(model, tx, config, key):
+def to_int8(t):
+    return jax.tree_map(lambda x:x.astype(jnp.int8) if x.dtype == jnp.float32 else x, t)
+
+
+def init_inference_state(apply_):
+  state = train_state.TrainState(
+    step=0,
+    apply_fn=model.apply,
+    params=(to_int8(model_vars['params']) if config.convert_int8 else model_vars['params']),
+    tx=None,
+    opt_state={}
+    )
+  return state
+
+def init_train_state(model, tx, config, store_opt_state, key):
   """
   We pass in "static" objects like model, tx, config as JAX compares them by
   object hash, and instantiating them inside causes pjit top-level annotations
@@ -173,14 +187,26 @@ def init_train_state(model, tx, config, key):
   model_vars = model.init({'params': key, 'dropout': key, 'aqt': key},
                           jnp.ones(input_shape),
                           jnp.ones(input_shape))
-  state = train_state.TrainState.create(
+
+
+  if store_opt_state:
+    state = train_state.TrainState.create(
       apply_fn=model.apply,
-      params=model_vars['params'],
+      params=to_int8(model_vars['params']) if config.convert_int8 else model_vars['params'],
       tx=tx)
+  else:
+    state = train_state.TrainState(
+      step=0,
+      apply_fn=model.apply,
+      params=to_int8(model_vars['params']) if config.convert_int8 else model_vars['params'],
+      tx=None,
+      opt_state={}
+    )
+
   return state
 
 
-def setup_initial_state(model, tx, config, rng, mesh, checkpoint_manager):
+def setup_initial_state(model, tx, config, rng, mesh, checkpoint_manager, store_opt_state=True):
   """ We initialize the model and optimizer state, and optionally load from a
   checkpoint as necessary.
 
@@ -191,13 +217,14 @@ def setup_initial_state(model, tx, config, rng, mesh, checkpoint_manager):
     rng: jax.prng key
     mesh: jax.devices() mesh
     checkpoint_manager: an Orbax checkpointing.CheckpointManager object
+    store_opt_state: True if initializing state with opt_state for training and false otherwise.
 
   Returns:
     state: the initialized train state
     state_mesh_annotations: the mesh annotations for the train state
   """
   init_train_state_partial = functools.partial(init_train_state, model, tx,
-                                               config)
+                                               config, store_opt_state)
   abstract_state = jax.eval_shape(init_train_state_partial, rng)
   state_logical_annotations = nn.get_partition_spec(abstract_state)
   unboxed_abstract_state = unbox_logicallypartioned_trainstate(abstract_state)
@@ -216,13 +243,16 @@ def setup_initial_state(model, tx, config, rng, mesh, checkpoint_manager):
     state_mesh_shardings = jax.tree_map(
         lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)
     if not state:
-      state = jax.jit(
+      if store_opt_state:
+        state = jax.jit(
           init_train_state_partial,
           in_shardings=None,
           out_shardings=state_mesh_shardings
-      )(rng)
-      if raw_params: # If we loaded a partial state, we need to merge it.
-        state = state.replace(params = raw_params)
+          )(rng)
+        if raw_params: # If we loaded a partial state, we need to merge it.
+          state = state.replace(params = raw_params)
+      else:
+        state = train_state.TrainState(step=0, params=raw_params, apply_fn=None, tx=tx, opt_state={})
     raw_params = None
 
   state = unbox_logicallypartioned_trainstate(state)
@@ -351,3 +381,4 @@ def _cross_entropy_with_logits_bwd(
 
 cross_entropy_with_logits.defvjp(_cross_entropy_with_logits_fwd,
                                  _cross_entropy_with_logits_bwd)
+
