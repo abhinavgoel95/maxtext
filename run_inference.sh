@@ -53,7 +53,7 @@ echo
 dataset_path=gs://${USER}-maxtext-datasets
 output_path=gs://${USER}-maxtext-outputs
 config="MaxText/configs/benchmark/${model}_base.yml"
-run_script="MaxText/decode.py"
+run_script="MaxText/decode_converted_model.py"
 run_name=${runid}-decode-${model}-model-int8
 options="run_name=${run_name} ici_tensor_parallelism=8 metrics_file='metrics.txt' steps=${steps} load_parameters_path=${checkpoint}  base_output_directory=${output_path} dataset_path=${dataset_path}"
 xla_flags="LIBTPU_INIT_ARGS='--xla_enable_async_all_gather=true TPU_MEGACORE=MEGACORE_DENSE'"
@@ -63,7 +63,7 @@ if "$dry_run"; then
 else
     cmd=''
 fi
-if "$bash_setup"; then
+if "$bash_setup"; then 
     setup='bash setup.sh;'
 fi
 
