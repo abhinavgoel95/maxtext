@@ -743,7 +743,8 @@ class Attention(nn.Module):
       dtype=self.dtype,
       weight_dtype=self.weight_dtype,
       name='query',
-      quant=self.quant)(inputs_q)
+      quant=self.quant,
+      use_fp8=self.config.use_fp8,)(inputs_q)
     return query_proj
 
   def kv_projection(self, inputs_kv: Array, proj_name: str) -> Array:
@@ -771,7 +772,8 @@ class Attention(nn.Module):
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
         name=proj_name,
-        quant=self.quant)(inputs_kv)
+        quant=self.quant,
+        use_fp8=self.config.use_fp8,)(inputs_kv)
     return kv_proj
 
   def qkv_projection(self, inputs: Array, proj_name: str):
@@ -785,7 +787,8 @@ class Attention(nn.Module):
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
         name=proj_name,
-        quant=self.quant)(inputs)
+        quant=self.quant,
+        use_fp8=self.config.use_fp8,)(inputs)
     qkv_proj = checkpoint_name(qkv_proj, 'qkv_proj')
     query, key, value = qkv_proj[:,:,0,...], qkv_proj[:,:,1,...], qkv_proj[:,:,2,...]
     return query, key, value
@@ -799,7 +802,8 @@ class Attention(nn.Module):
       dtype=self.dtype,
       weight_dtype=self.weight_dtype,
       name='out',
-      quant=self.quant)(out)
+      quant=self.quant,
+      use_fp8=self.config.use_fp8,)(out)
     return out_proj
 
   def key_rotary(self, key: Array, inputs_positions: Array):

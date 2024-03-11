@@ -216,6 +216,7 @@ class MlpBlock(nn.Module):
             name='wi',
             quant=self.quant,
             use_bias=self.use_bias,
+            use_fp8=cfg.use_fp8,
       )(inputs)
       for idx, act_fn in enumerate(self.activations):
         y = _convert_to_activation_function(act_fn)(x[:,:,idx,...])
@@ -232,6 +233,7 @@ class MlpBlock(nn.Module):
             name=dense_name,
             quant=self.quant,
             use_bias=self.use_bias,
+            use_fp8=cfg.use_fp8,
         )(inputs)
         x = _convert_to_activation_function(act_fn)(x)
         activations.append(x)
@@ -255,6 +257,7 @@ class MlpBlock(nn.Module):
         name='wo',
         quant=self.quant,
         use_bias=self.use_bias,
+        use_fp8=cfg.use_fp8,
     )(x)
 
     output = checkpoint_name(output, 'mlpwo')
@@ -286,7 +289,8 @@ class MoeBlock(nn.Module):
             dtype=self.dtype,
             kernel_init=self.kernel_init,
             kernel_axes=self.kernel_axes,
-            name='gate')(inputs)
+            name='gate',
+            use_fp8=self.config.use_fp8,)(inputs)
 
     weights, selected_experts = lax.top_k(gate_logits, self.num_experts_per_tok)
     weights = jax.nn.softmax(weights.astype(jnp.float32), axis=-1)
