@@ -87,6 +87,7 @@ class DenseGeneral(nn.Module):
   kernel_axes: Tuple[str, ...] = ()
   quant: Optional[Quant] = None
   use_bias: bool = False
+  use_fp8: bool = False
 
   @nn.compact
   def __call__(self, inputs: Array) -> Array:
@@ -104,6 +105,9 @@ class DenseGeneral(nn.Module):
       dot_general = lax.dot_general
       if self.quant:
         dot_general_cls = self.quant.dot_general_cls()
+        dot_general = dot_general_cls()
+      if self.use_fp8:
+        dot_general_cls = nn.Fp8DotGeneralOp
         dot_general = dot_general_cls()
       return dot_general(
         inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
