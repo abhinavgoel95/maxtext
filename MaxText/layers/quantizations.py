@@ -21,11 +21,20 @@ from aqt.jax.v2.flax import aqt_flax
 from common_types import Config
 from dataclasses import dataclass
 import jax
+import flax.linen as nn
 import jax.numpy as jnp
 from jax.tree_util import tree_flatten_with_path, tree_unflatten
 
 @dataclass
-class AqtQuantization:
+class Quantization:
+    """Base class for quantization configurations"""
+
+    def dot_general_cls(self):
+        """ Placeholder for dot_general implementation in subclasses. """
+        pass 
+
+@dataclass
+class AqtQuantization(Quantization):
   """ Configures AQT quantization github.com/google/aqt. """
   quant_dg: aqt_config.DotGeneral
   quant_mode: aqt_flax.QuantMode = aqt_flax.QuantMode.TRAIN
@@ -47,6 +56,16 @@ class AqtQuantization:
       )
     )
     return aqt_einsum
+  
+@dataclass
+class Fp8Quantization(Quantization):
+  """ Configures Fp8 quantization for NVIDIA GPUs"""
+  quant_mode = "train"
+
+  def dot_general_cls(self):
+    """ Returns dot_general configured with aqt params. """
+    return nn.Fp8DotGeneralOp
+  
 
 def _get_quant_config(config):
   if not config.quantization or config.quantization == '':
@@ -71,6 +90,8 @@ def _get_quant_config(config):
       dlhs_accumulator_dtype=jnp.int32,
       drhs_accumulator_dtype=drhs_accumulator_dtype,
     )
+  elif config.quantization == "fp8":
+    return "fp8"
   else:
     raise ValueError(f'Invalid value configured for quantization {config.quantization}.')
 
@@ -96,6 +117,8 @@ def configure_quantization(config: Config, quant_mode_str: str = 'train'):
   """ Configure quantization based on user config and quant mode."""
   quant_cfg = _get_quant_config(config)
   if quant_cfg:
+    if quant_cfg == "fp8":
+      return Fp8Quantization()
     quant_mode = get_quant_mode(quant_mode_str)
     return AqtQuantization(quant_dg=quant_cfg, quant_mode=quant_mode)
   return None

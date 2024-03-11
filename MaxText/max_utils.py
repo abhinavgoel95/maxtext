@@ -28,7 +28,6 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
 
-
 import json
 import yaml
 import flax
@@ -325,7 +324,7 @@ def init_decode_state(apply_fn, params):
 
 def init_training_state(apply_fn, params, tx):
   """Init train state with null opt state for decode."""
-  state = train_state.TrainState.create(
+  state = train_state.TrainState.create( 
     apply_fn=apply_fn,
     params=params,
     tx=tx
@@ -348,7 +347,10 @@ def init_initial_state(model, tx, config, is_training, key):
                           jnp.ones(input_shape, dtype=jnp.int32),
                           jnp.ones(input_shape, dtype=jnp.int32))
   if is_training:
-    return init_training_state(model.apply, model_vars['params'], tx)
+    if config.quantization=="fp8":
+      return init_training_state(model.apply, model_vars, tx)
+    else:
+      return init_training_state(model.apply, model_vars['params'], tx)
   return init_decode_state(model.apply, model_vars['params'])
 
 def load_decode_model_vars(model, config, rng, mesh):
