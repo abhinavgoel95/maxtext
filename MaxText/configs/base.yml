@@ -60,6 +60,7 @@ dtype: "bfloat16"
 quantization: ""
 # Shard the range finding operation for quantization. By default this is set to number of slices.
 quantization_local_shard_count: -1
+use_fp8: False
 
 decoder_block: "llama2" # which style of DecoderBlock to use.
 # Global parameter scale needs to be a power of 2. If you want finer grained control of the model sizes
