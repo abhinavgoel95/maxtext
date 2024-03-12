@@ -324,7 +324,7 @@ def init_decode_state(apply_fn, params):
 
 def init_training_state(apply_fn, params, tx):
   """Init train state with null opt state for decode."""
-  state = train_state.TrainState.create( 
+  state = train_state.TrainState.create(
     apply_fn=apply_fn,
     params=params,
     tx=tx
