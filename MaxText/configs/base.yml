@@ -195,7 +195,32 @@ use_post_ffw_norm: False
 # Combine matmuls for QKV and MLP
 fused_qkv: False
 fused_mlp: False
+
+
 comm_gemm_overlap: False
+overlap_config: {
+  "fc1_fprop": {
+      "method": "ring_exchange",  # "pipeline" for collective kernels instead of send/recv
+      "cga_size": 1,  # default is 2 for "pipeline"
+      "num_sm": 1,  # ignored for "ring_exchange", must be tuned for "pipeline"
+      "set_sm_margin": False,  # set to True for "pipeline"
+      "atomic_gemm": False,  # more performant when not using CUDA Graphs
+      "use_ce": True,  # ignored (always False) for "pipeline" method
+      "aggregate": False,
+  },
+  "fc2_fprop": {
+      "method": "pipeline", #for collective kernels instead of send/recv
+      "num_splits": 4,  # independent of TP size for "pipeline"
+      "cga_size": 2,  # default is 2 for "pipeline"
+      "num_sm": 8,  # ignored for "ring_exchange", must be tuned for "pipeline"
+      "set_sm_margin": True,  # set to True for "pipeline"
+      "atomic_gemm": False,  # more performant when not using CUDA Graphs
+      "use_ce": False,  # ignored (always False) for "pipeline" method
+  },
+  "fc2_dgrad": {
+    "method": "ring_exchange",
+  },
+}
 
 record_internal_nn_metrics: 0
 
@@ -270,7 +295,7 @@ logical_axis_rules: [
                       ['exp', 'expert'],
                     ]
 # Axes used for DCN must be earlier in this list than ICI, see (b/339009148) for details
-data_sharding: [['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'tensor', 'tensor_sequence', 'expert', 'autoregressive']]
+data_sharding: [['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'tensor', 'expert', 'autoregressive']]
 
 # sharding tolerance: float between 0.0 and 1.0 representing the allowed percentage of non-sharded parameters.
 sharding_tolerance: 0.02

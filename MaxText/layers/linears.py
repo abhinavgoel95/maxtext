@@ -142,24 +142,39 @@ class DenseGeneral(nn.Module):
       from jax.sharding import NamedSharding
       from jax.sharding import PartitionSpec as P
 
-      @jax.custom_vjp
       def te_gemm_with_overlap(A, B):
           return te_gemm_impl(
               x=A,
-              kernel=jax.lax.with_sharding_constraint(B, NamedSharding(self.mesh, P(None, "tensor_sequence"))),
+              kernel=jax.lax.with_sharding_constraint(B, NamedSharding(self.mesh, P(None, "tensor_sequence"))) if self.comm_gemm_overlap_type=="fc1" else jax.lax.with_sharding_constraint(B, NamedSharding(self.mesh, P("tensor_sequence", None))),
+              comm_overlap_name=self.comm_gemm_overlap_type
+          )
+
+      """
+        Temp WAR for FC1 backward pass
+      """
+      @jax.custom_vjp
+      def te_gemm_with_overlap_fc1_temp_war(A, B):
+          return te_gemm_impl(
+              x=A,
+              kernel=jax.lax.with_sharding_constraint(B, NamedSharding(self.mesh, P(None, "tensor_sequence"))) if self.comm_gemm_overlap_type=="fc1" else jax.lax.with_sharding_constraint(B, NamedSharding(self.mesh, P("tensor_sequence", None))),
               comm_overlap_name=self.comm_gemm_overlap_type
           )
 
       def custom_gemm_fwd(A, B):
-          return te_gemm_with_overlap(A, B), (A, B)
+          return te_gemm_with_overlap_fc1_temp_war(A, B), (A, B)
 
-      def custom_gemm_bwd(res, g):
+      def custom_gemm_bwd(res, g): #define this in a shard-map?
           A, B = res
           dA = jnp.einsum('...ik,...jk->...ij', g, B)
-          dB = jnp.einsum('...ij,...ik->...jk', A, g)[0]
+          dB = jnp.einsum('...ij,...ik->...jk', A, g)
+          dB = jnp.sum(dB, axis=0, dtype=jnp.bfloat16)
           return dA, dB
 
-      te_gemm_with_overlap.defvjp(custom_gemm_fwd, custom_gemm_bwd)
+      te_gemm_with_overlap_fc1_temp_war.defvjp(custom_gemm_fwd, custom_gemm_bwd)
+
+      if self.comm_gemm_overlap_type=="fc1":
+        te_gemm_with_overlap = te_gemm_with_overlap_fc1_temp_war
+
       collective_gemm = jax.jit(partial(te_gemm_with_overlap))
       out = collective_gemm(inputs, kernel)
       return out
@@ -266,25 +281,34 @@ class MlpBlock(nn.Module):
     # e.g. ('relu',) or ('gelu', 'linear') for gated-gelu.
     activations = []
     if cfg.fused_mlp:
+      if self.config.comm_gemm_overlap:
+          kernel_axes=("embed", "mlp")
+          features=(len(self.activations) * self.intermediate_dim)
+      else:
+          kernel_axes=("embed", "mlp", "num_activations")
+          features=(self.intermediate_dim, len(self.activations))
       x = DenseGeneral(
-          (len(self.activations), self.intermediate_dim),
+          features,
           dtype=self.dtype,
           weight_dtype=self.weight_dtype,
           kernel_init=self.kernel_init,
-          kernel_axes=("embed", "num_activations", "mlp"),
+          kernel_axes=kernel_axes,
           name="wi",
           quant=self.quant,
           use_bias=self.use_bias,
           matmul_precision=self.config.matmul_precision,
           comm_gemm_overlap=self.config.comm_gemm_overlap,
-          comm_gemm_overlap_type="ag_gemm",
+          comm_gemm_overlap_type="fc1",
           mesh=self.mesh
       )(inputs)
+      if self.config.comm_gemm_overlap:
+        x = x.reshape((x.shape[0], x.shape[1], x.shape[2]//len(self.activations), len(self.activations)))
       x = checkpoint_name(x, "mlpwi")
       for idx, act_fn in enumerate(self.activations):
-        y = _convert_to_activation_function(act_fn)(x[:, :, idx, ...])
+        y = _convert_to_activation_function(act_fn)(x[:, :, :, idx])
         activations.append(y)
     else:
+      comm_gemm_overlap = self.config.comm_gemm_overlap
       for idx, act_fn in enumerate(self.activations):
         dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
         x = DenseGeneral(
@@ -297,10 +321,11 @@ class MlpBlock(nn.Module):
             quant=self.quant,
             use_bias=self.use_bias,
             matmul_precision=self.config.matmul_precision,
-            comm_gemm_overlap=self.config.comm_gemm_overlap,
-            comm_gemm_overlap_type="ag_gemm",
+            comm_gemm_overlap=comm_gemm_overlap,
+            comm_gemm_overlap_type="fc1",
             mesh=self.mesh
         )(inputs)
+        comm_gemm_overlap=False
         x = checkpoint_name(x, "mlp" + dense_name)
         if cfg.activations_in_float32:
           x = x.astype(jnp.float32)
@@ -324,8 +349,8 @@ class MlpBlock(nn.Module):
         quant=self.quant,
         use_bias=self.use_bias,
         matmul_precision=self.config.matmul_precision,
-        comm_gemm_overlap=False, #self.config.comm_gemm_overlap #hard-coded to False now for debugging
-        comm_gemm_overlap_type="gemm_rs",
+        comm_gemm_overlap=self.config.comm_gemm_overlap, #hard-coded to False now for debugging
+        comm_gemm_overlap_type="fc2",
         mesh=self.mesh
     )(x)
 

@@ -402,6 +402,8 @@ class AttentionOp(nn.Module):
 
     _, _, _, head_dim = query.shape  # pylint: disable=unused-variable
 
+    decoder_segment_ids = nn.with_logical_constraint(decoder_segment_ids, ("activation_batch", "activation_length"))
+
     sliding_window_size = self.sliding_window_size
     if self.attention_type == AttentionType.LOCAL_SLIDING:
       sliding_window_size = [self.sliding_window_size, 0]
@@ -426,6 +428,7 @@ class AttentionOp(nn.Module):
         scale_factor=1.0 / math.sqrt(head_dim),
         transpose_batch_sequence=False,
         window_size=sliding_window_size,
+        context_parallel_axis="sequence"
     )
     return dpa_layer(query, key, value, mask=attn_mask)
 

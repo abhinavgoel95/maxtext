@@ -519,6 +519,7 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
         extra_dpo_args = [reference_params]
     grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
     (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, state.params, *extra_dpo_args, is_train=True)
+
   intermediate_outputs = aux["intermediate_outputs"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
@@ -534,6 +535,7 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
             jax.tree_util.tree_map(lambda x: x.with_memory_kind(kind="device"), state_mesh_shardings.opt_state),
         )
     )
+
   new_state = state.apply_gradients(grads=grads)
 
   scalar_metrics = {
@@ -872,7 +874,7 @@ def train_loop(config, state=None):
       with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
         if config.comm_gemm_overlap:
           import transformer_engine.jax as te
-          with te.sharding.global_shard_guard(te.MeshResource(tp_resource='tensor_sequence', cp_resource='tensor_sequence', dp_resource="data", fsdp_resource="fsdp")):
+          with te.sharding.global_shard_guard(te.MeshResource(tp_resource='tensor_sequence', dp_resource="data", fsdp_resource="fsdp")):
             state, metrics = p_train_step(state, example_batch, nextrng)
         else:
           state, metrics = p_train_step(state, example_batch, nextrng)
