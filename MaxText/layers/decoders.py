@@ -68,6 +68,7 @@ class DecoderLayer(nn.Module):
   config: Config
   mesh: Mesh
   quant: Optional[Quant] = None
+  comm_gemm_overlap: Optional[list] = None
 
   @nn.compact
   def __call__(
@@ -157,6 +158,7 @@ class DecoderLayer(nn.Module):
         model_mode=model_mode,
         config=cfg,
         quant=self.quant,
+        comm_gemm_overlap=self.comm_gemm_overlap,
     )(lnx, deterministic=deterministic)
     if model_mode == MODEL_MODE_PREFILL:
       mlp_lnx = nn.with_logical_constraint(mlp_lnx, logical_axis_names)

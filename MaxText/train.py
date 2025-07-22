@@ -636,7 +636,12 @@ def train_loop(config, recorder, state=None):
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
           with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-            state, metrics = p_train_step(state, example_batch, nextrng)
+            if config.comm_gemm_overlap:
+              import transformer_engine.jax as te
+              with te.sharding.global_shard_guard(te.MeshResource(tp_resource='tensor_sequence', cp_resource='tensor_sequence', dp_resource="data", fsdp_resource="fsdp")):
+                state, metrics = p_train_step(state, example_batch, nextrng)
+            else:
+              state, metrics = p_train_step(state, example_batch, nextrng)
 
       step_time_delta = datetime.datetime.now() - last_step_completion
       last_step_completion = datetime.datetime.now()

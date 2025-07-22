@@ -72,6 +72,9 @@ def _compute_dot_general(inputs, kernel, kernel_axes, axis, contract_ind, matmul
     return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
   return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision)
 
+def _compute_te_gemm(inputs, kernel, comm_overlaps, contracting_dims=((2,), (0,),)):
+  from transformer_engine.jax.dense import dense
+  return dense(inputs, kernel, None, contracting_dims=contracting_dims, input_axes="data", kernel_axes="tensor_sequence", comm_overlaps=comm_overlaps)
 
 def _compute_dot_general_nnx(
     inputs,
@@ -80,7 +83,8 @@ def _compute_dot_general_nnx(
     contract_ind,
     matmul_precision,
     quant_dot_general: nnx_wrappers.ToNNX | None,
-    initializing: bool
+    initializing: bool,
+    comm_gemm_overlap: Optional[list] = []
 ):
   """Computes a dot_general operation that may be quantized."""
   dot_general = lax.dot_general
@@ -89,6 +93,8 @@ def _compute_dot_general_nnx(
     if initializing:
       return quant_dot_general.lazy_init(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
     return quant_dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None, mutable=["aqt"])
+  elif comm_gemm_overlap:
+    return _compute_te_gemm(inputs, kernel, comm_gemm_overlap, ((axis, contract_ind), ((), ())))
   return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision)
 
 
@@ -110,6 +116,7 @@ class DenseGeneral(nnx.Module):
       parameter_memory_host_offload: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs,
+      comm_gemm_overlap: Optional[list] = None
   ):
     """Initializes the DenseGeneral module.
 
@@ -139,6 +146,7 @@ class DenseGeneral(nnx.Module):
     self.use_bias = use_bias
     self.matmul_precision = matmul_precision
     self.parameter_memory_host_offload = parameter_memory_host_offload
+    self.comm_gemm_overlap = comm_gemm_overlap
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -223,6 +231,7 @@ class DenseGeneral(nnx.Module):
         self.matmul_precision,
         self.quant_dot_general,
         _initializing,
+        self.comm_gemm_overlap,
     )
 
     if self.bias is not None:
@@ -312,6 +321,7 @@ class MlpBlock(nnx.Module):
       model_mode: Optional[str] = None,
       *,
       rngs: nnx.Rngs,
+      comm_gemm_overlap: Optional[list] = []
   ) -> None:
     """A MlpBlock module.
     
@@ -342,6 +352,7 @@ class MlpBlock(nnx.Module):
     self.use_pre_norm = use_pre_norm
     self.quant = quant
     self.model_mode = model_mode
+    self.comm_gemm_overlap = comm_gemm_overlap
 
     if self.use_pre_norm:
       self.mlp_layer_norm = self.get_norm_layer(num_features=in_features)(
@@ -366,6 +377,7 @@ class MlpBlock(nnx.Module):
           use_bias=self.use_bias,
           matmul_precision=self.config.matmul_precision,
           rngs=rngs,
+          comm_gemm_overlap=self.comm_gemm_overlap[0],
       )
     else:
       for idx in range(len(self.activations)):
@@ -395,6 +407,7 @@ class MlpBlock(nnx.Module):
         use_bias=self.use_bias,
         matmul_precision=self.config.matmul_precision,
         rngs=rngs,
+        comm_gemm_overlap=self.comm_gemm_overlap[1],
     )
 
   def get_norm_layer(self, num_features: int):
@@ -475,6 +488,7 @@ def mlp_block(
     quant: Optional[Quant] = None,
     model_mode: Optional[str] = None,
     name: Optional[str] = None,
+    comm_gemm_overlap: Optional[list] = None
 ):
   """Creates a MlpBlock Linen module using nnx.bridge.to_linen."""
   module = nnx_wrappers.to_linen(
@@ -494,5 +508,6 @@ def mlp_block(
       name=name,
       metadata_fn=variable_to_logically_partitioned,
       abstract_init=False,
+      comm_gemm_overlap=comm_gemm_overlap,
   )
   return module

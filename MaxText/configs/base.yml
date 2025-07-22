@@ -270,6 +270,8 @@ v_head_dim: 128
 fused_qkv: False
 fused_mlp: False
 
+comm_gemm_overlap: False
+
 record_internal_nn_metrics: 0
 
 # Output directory

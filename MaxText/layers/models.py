@@ -47,6 +47,7 @@ class Transformer(nn.Module):
   config: Config
   mesh: Mesh
   quant: Quant
+  comm_overlaps: Optional[list] = None
 
   def setup(self):
     """Initialize shared_embedding & decoder layers."""
@@ -63,7 +64,7 @@ class Transformer(nn.Module):
         config=cfg,
     )
     self.vision_encoder = VisionEncoder(config=cfg, mesh=mesh) if cfg.use_multimodal else None
-    self.decoder = Decoder(config=cfg, shared_embedding=self.shared_embedding, mesh=mesh, quant=self.quant)
+    self.decoder = Decoder(config=cfg, shared_embedding=self.shared_embedding, mesh=mesh, quant=self.quant, comm_gemm_overlap=self.comm_overlaps)
     # If MTP is enabled via config, set up the MTP block.
     if self.config.mtp_num_layers > 0:
       # Get the list of layer blueprints for the current model.

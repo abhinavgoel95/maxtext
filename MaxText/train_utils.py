@@ -23,13 +23,20 @@ from MaxText.layers import models
 from MaxText import optimizers
 from MaxText import checkpointing
 from MaxText import maxtext_utils
+from MaxText import max_utils
 
+def maybe_setup_transformer_engine_comm_gemm_overlap(config, mesh):
+  if config.comm_gemm_overlap:
+    comm_overlaps = max_utils.maybe_initialize_transformer_engine_comm_gemm_overlap(config, mesh)
+    return comm_overlaps
+  return None
 
 def get_transformer_model(config, mesh, quant):
+  comm_overlaps = maybe_setup_transformer_engine_comm_gemm_overlap(config, mesh)
   if config.model_fsdp_ag_once:
     return models.ZeroOneTransformer(config, mesh, quant=quant)
   else:
-    return models.Transformer(config, mesh, quant=quant)
+    return models.Transformer(config, mesh, quant=quant, comm_overlaps=comm_overlaps)
 
 
 def create_model(config, mesh):

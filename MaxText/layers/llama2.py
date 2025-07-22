@@ -48,6 +48,7 @@ class LlamaDecoderLayer(nn.Module):
   config: Config
   mesh: Mesh
   quant: Optional[Quant] = None
+  comm_gemm_overlap: Optional[list] = None
 
   @nn.compact
   def __call__(
@@ -147,6 +148,7 @@ class LlamaDecoderLayer(nn.Module):
         config=cfg,
         quant=self.quant,
         model_mode=model_mode,
+        comm_gemm_overlap=self.comm_gemm_overlap,
     )(hidden_states, deterministic=deterministic)
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, activation_axis_names)
 

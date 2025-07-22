@@ -121,6 +121,27 @@ def add_text_to_summary_writer(key, value, summary_writer):
     summary_writer.add_text(key, value)
 
 
+def maybe_initialize_transformer_engine_comm_gemm_overlap(config, mesh):
+  import transformer_engine_jax as tex
+  from transformer_engine.jax.cpp_extensions import CommOverlapHelper, CommOverlapHelperSet
+
+  batch_shard_dims = abs(config.ici_data_parallelism * config.ici_fsdp_parallelism * config.dcn_data_parallelism * config.dcn_fsdp_parallelism)
+  buffer_shape = [config.micro_batch_size_to_train_on//batch_shard_dims, config.max_target_length, config.base_mlp_dim]
+
+  fprop_1_overlap = CommOverlapHelper(
+        comm_type=tex.CommOverlapType.AG,
+        method=tex.CommOverlapMethod.RING_EXCHANGE,
+        buffer_shape=buffer_shape,
+    )
+  comm_overlaps = [CommOverlapHelperSet(fprop=fprop_1_overlap)]
+  fprop_2_overlap = CommOverlapHelper(
+            comm_type=tex.CommOverlapType.RS,
+            method=tex.CommOverlapMethod.RING_EXCHANGE,
+            buffer_shape=buffer_shape,
+        )
+  comm_overlaps.append(CommOverlapHelperSet(fprop=fprop_2_overlap))
+  return comm_overlaps
+
 def maybe_initialize_jax_distributed_system(raw_keys):
   """The best recipe to initialize the Jax Distributed System has varied over time. We keep a layer of
   indirection in MaxText to avoid breaking the call sites unnecessarily.
@@ -152,9 +173,7 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     max_logging.log("Attempting to initialize the jax distributed system for CPU backend...")
     initialize_jax_for_cpu(raw_keys)
     max_logging.log("Jax distributed system initialized on CPUs!")
-  elif (raw_keys["enable_checkpointing"] and raw_keys["compile_topology_num_slices"] == -1) or raw_keys[
-      "hardware"
-  ] == "gpu_multiprocess":
+  elif (raw_keys["enable_checkpointing"] and raw_keys["compile_topology_num_slices"] == -1) or raw_keys["hardware"] == "gpu_multiprocess" or raw_keys["hardware"] == "gpu_mpi":
     max_logging.log("Attempting to initialize the jax distributed system...")
     if not raw_keys["enable_emergency_checkpoint"]:
       jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
@@ -164,8 +183,13 @@ def maybe_initialize_jax_distributed_system(raw_keys):
         jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
         ocp.multihost.initialize_runtime_to_distributed_ids()
         ocp.multihost.initialize_distributed_to_device_ids()
+      elif raw_keys["hardware"] == "gpu_mpi":
+        max_logging.log("Attempting to initialize the jax distributed system with MPI...")
+        from mpi4py import MPI
+        jax.distributed.initialize(cluster_detection_method="mpi4py", initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
       else:
         initialize_jax_for_tpu_with_emergency_checkpointing(raw_keys)
+    
     max_logging.log("Jax distributed system initialized!")
 
 
