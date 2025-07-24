@@ -64,7 +64,6 @@ class LlamaDecoderLayer(nn.Module):
   ):
     cfg = self.config
     mesh = self.mesh
-
     if model_mode == MODEL_MODE_PREFILL:
       activation_axis_names = ("activation_batch", "prefill_activation_norm_length", "activation_embed")
     else:
@@ -149,6 +148,7 @@ class LlamaDecoderLayer(nn.Module):
         quant=self.quant,
         model_mode=model_mode,
         comm_gemm_overlap=self.comm_gemm_overlap,
+        mesh=self.mesh
     )(hidden_states, deterministic=deterministic)
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, activation_axis_names)
 

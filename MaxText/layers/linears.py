@@ -72,9 +72,13 @@ def _compute_dot_general(inputs, kernel, kernel_axes, axis, contract_ind, matmul
     return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
   return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision)
 
-def _compute_te_gemm(inputs, kernel, comm_overlaps, contracting_dims=((2,), (0,),)):
+def _compute_te_gemm(inputs, kernel, comm_overlaps, contracting_dims=((1,), (0,),)):
   from transformer_engine.jax.dense import dense
-  return dense(inputs, kernel, None, contracting_dims=contracting_dims, input_axes="data", kernel_axes="tensor_sequence", comm_overlaps=comm_overlaps)
+  with (
+    mesh,
+    global_shard_guard(mesh_resource),
+  ):
+    return dense(inputs, kernel, None, contracting_dims=contracting_dims, input_axes=(("data", "fsdp"), "tensor_sequence", None), kernel_axes=("tensor_sequence", "fsdp"), comm_overlaps=comm_overlaps)
 
 def _compute_dot_general_nnx(
     inputs,
@@ -321,7 +325,8 @@ class MlpBlock(nnx.Module):
       model_mode: Optional[str] = None,
       *,
       rngs: nnx.Rngs,
-      comm_gemm_overlap: Optional[list] = []
+      comm_gemm_overlap: Optional[list] = [],
+      mesh = None
   ) -> None:
     """A MlpBlock module.
     
@@ -353,7 +358,7 @@ class MlpBlock(nnx.Module):
     self.quant = quant
     self.model_mode = model_mode
     self.comm_gemm_overlap = comm_gemm_overlap
-
+    self.mesh = mesh
     if self.use_pre_norm:
       self.mlp_layer_norm = self.get_norm_layer(num_features=in_features)(
           dtype=config.dtype,
@@ -377,7 +382,8 @@ class MlpBlock(nnx.Module):
           use_bias=self.use_bias,
           matmul_precision=self.config.matmul_precision,
           rngs=rngs,
-          comm_gemm_overlap=self.comm_gemm_overlap[0],
+          comm_gemm_overlap=None if not self.comm_gemm_overlap else self.comm_gemm_overlap[0],
+          mesh = self.mesh,
       )
     else:
       for idx in range(len(self.activations)):
@@ -393,6 +399,7 @@ class MlpBlock(nnx.Module):
             use_bias=self.use_bias,
             matmul_precision=self.config.matmul_precision,
             rngs=rngs,
+            comm_gemm_overlap=None if not self.comm_gemm_overlap or idx==1 else self.comm_gemm_overlap[0],
         )
         setattr(self, dense_name, module)
     self.dropout = nnx.Dropout(rate=self.intermediate_dropout_rate, broadcast_dims=(-2,), rngs=rngs)
@@ -407,7 +414,7 @@ class MlpBlock(nnx.Module):
         use_bias=self.use_bias,
         matmul_precision=self.config.matmul_precision,
         rngs=rngs,
-        comm_gemm_overlap=self.comm_gemm_overlap[1],
+        comm_gemm_overlap=None if not self.comm_gemm_overlap else None, #self.comm_gemm_overlap[1],
     )
 
   def get_norm_layer(self, num_features: int):

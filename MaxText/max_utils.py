@@ -120,26 +120,47 @@ def add_text_to_summary_writer(key, value, summary_writer):
   if jax.process_index() == 0:
     summary_writer.add_text(key, value)
 
-
 def maybe_initialize_transformer_engine_comm_gemm_overlap(config, mesh):
+  import transformer_engine.jax as te
   import transformer_engine_jax as tex
   from transformer_engine.jax.cpp_extensions import CommOverlapHelper, CommOverlapHelperSet
+  from mpi4py import MPI
 
   batch_shard_dims = abs(config.ici_data_parallelism * config.ici_fsdp_parallelism * config.dcn_data_parallelism * config.dcn_fsdp_parallelism)
-  buffer_shape = [config.micro_batch_size_to_train_on//batch_shard_dims, config.max_target_length, config.base_mlp_dim]
+  buffer_shape = [config.micro_batch_size_to_train_on//batch_shard_dims, config.max_target_length, config.base_emb_dim]
 
-  fprop_1_overlap = CommOverlapHelper(
-        comm_type=tex.CommOverlapType.AG,
-        method=tex.CommOverlapMethod.RING_EXCHANGE,
-        buffer_shape=buffer_shape,
-    )
-  comm_overlaps = [CommOverlapHelperSet(fprop=fprop_1_overlap)]
-  fprop_2_overlap = CommOverlapHelper(
-            comm_type=tex.CommOverlapType.RS,
-            method=tex.CommOverlapMethod.RING_EXCHANGE,
-            buffer_shape=buffer_shape,
-        )
-  comm_overlaps.append(CommOverlapHelperSet(fprop=fprop_2_overlap))
+  # Get the available mesh axis names
+  available_axes = set(mesh.axis_names) if hasattr(mesh, 'axis_names') else set()
+
+  # Map to available axes, falling back to None if not available
+  tp_resource = 'tensor_sequence' if 'tensor_sequence' in available_axes else ('tensor' if 'tensor' in available_axes else None)
+  dp_resource = 'data' if 'data' in available_axes else None
+  fsdp_resource = 'fsdp' if 'fsdp' in available_axes else None
+
+  # Initialize CommOverlapHelper within the global_shard_guard context
+  with (
+          mesh,
+          te.sharding.global_shard_guard(
+              te.sharding.MeshResource(
+                  tp_resource=tp_resource,
+                  cp_resource=None,
+                  dp_resource=dp_resource,
+                  fsdp_resource=fsdp_resource
+              )
+          )
+  ):
+    fprop_1_overlap = CommOverlapHelper(
+          comm_type=tex.CommOverlapType.AG,
+          method=tex.CommOverlapMethod.RING_EXCHANGE,
+          buffer_shape=buffer_shape,
+      )
+    comm_overlaps = [CommOverlapHelperSet(fprop=fprop_1_overlap)]
+    fprop_2_overlap = CommOverlapHelper(
+              comm_type=tex.CommOverlapType.RS,
+              method=tex.CommOverlapMethod.RING_EXCHANGE,
+              buffer_shape=buffer_shape,
+          )
+    comm_overlaps.append(CommOverlapHelperSet(fprop=fprop_2_overlap))
   return comm_overlaps
 
 def maybe_initialize_jax_distributed_system(raw_keys):

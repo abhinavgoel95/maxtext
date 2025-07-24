@@ -240,6 +240,7 @@ class Decoder(nn.Module):
   shared_embedding: nn.Module
   mesh: Mesh
   quant: Optional[Quant] = None
+  comm_gemm_overlap: Optional[list] = None
 
   def setup(self):
     """Initialize decoder layer."""
@@ -441,7 +442,7 @@ class Decoder(nn.Module):
         length=length,
         metadata_params={nn.PARTITION_NAME: metdata_axis_name},
     )
-    return scan_fn(config=cfg, mesh=mesh, name=metdata_axis_name, quant=self.quant, **kwargs)
+    return scan_fn(config=cfg, mesh=mesh, name=metdata_axis_name, quant=self.quant, comm_gemm_overlap=self.comm_gemm_overlap, **kwargs)
 
   def get_pipeline_stage_module(self, decoder_blocks):
     """get pipeline stage module"""
@@ -740,7 +741,7 @@ class Decoder(nn.Module):
                   "is_nope_layer": llama4.determine_is_nope_layer(lyr, self.config.nope_layer_interval),
                   "is_moe_layer": llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step),
               }
-            layer = RemattedBlockLayer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, **layer_kwargs)
+            layer = RemattedBlockLayer(config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, comm_gemm_overlap=self.comm_gemm_overlap, **layer_kwargs)
             y = layer(
                 y,
                 decoder_segment_ids,
