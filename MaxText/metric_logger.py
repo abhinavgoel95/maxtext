@@ -1,18 +1,16 @@
-"""
-Copyright 2023 Google LLC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023–2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # pylint: disable=bare-except, consider-using-generator
 # pytype: disable=attribute-error
@@ -204,7 +202,9 @@ class MetricLogger:
   def record_eval_metrics(self, step, metrics=None, eval_step_count=None):
     """Records eval metrics and writes the metrics to GCS and/or to TensorBoard."""
     if metrics:
-      self.cumulative_eval_metrics["scalar"]["eval/total_loss"] += float(metrics["scalar"].get("evaluation/total_loss", 0.0))
+      self.cumulative_eval_metrics["scalar"]["eval/total_loss"] += float(
+          metrics["scalar"].get("evaluation/total_loss", 0.0)
+      )
       self.cumulative_eval_metrics["scalar"]["eval/total_weights"] += float(
           metrics["scalar"].get("evaluation/total_weights", 0.0)
       )

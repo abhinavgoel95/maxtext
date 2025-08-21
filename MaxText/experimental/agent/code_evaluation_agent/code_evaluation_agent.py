@@ -72,9 +72,24 @@ logger = logging.getLogger(__name__)
 
 parser = argparse.ArgumentParser(description="Code Evaluation Agent")
 parser.add_argument("--error_penalty", type=int, default=10, help="Penalty for errors in test case generation or execution.")
-parser.add_argument("--pytorch_path", type=str, default="../code_generation_agent/dataset/PyTorch/", help="Path to the directory containing PyTorch files.")
-parser.add_argument("--jax_path", type=str, default="../code_generation_agent/dataset/jax_converted/", help="Path to the directory containing JAX files.")
-parser.add_argument("--testcase_path", type=str, default="../code_generation_agent/dataset/test_cases/", help="Path to the directory for generated test cases.")
+parser.add_argument(
+    "--pytorch_path",
+    type=str,
+    default="../code_generation_agent/dataset/PyTorch/",
+    help="Path to the directory containing PyTorch files.",
+)
+parser.add_argument(
+    "--jax_path",
+    type=str,
+    default="../code_generation_agent/dataset/jax_converted/",
+    help="Path to the directory containing JAX files.",
+)
+parser.add_argument(
+    "--testcase_path",
+    type=str,
+    default="../code_generation_agent/dataset/test_cases/",
+    help="Path to the directory for generated test cases.",
+)
 parser.add_argument("--overwrite_existing_files", action="store_true", help="Overwrite existing test case files.")
 args = parser.parse_args()
 

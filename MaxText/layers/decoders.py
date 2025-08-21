@@ -1,22 +1,22 @@
-#  Copyright 2025 Google LLC
+# Copyright 2023–2025 Google LLC
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#       https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """"Module for decoder layers."""
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
-from typing import Any, Optional
+from typing import Any
 import functools
 
 import jax
@@ -69,7 +69,7 @@ class DecoderLayer(nn.Module):
   config: Config
   mesh: Mesh
   model_mode: str
-  quant: Optional[Quant] = None
+  quant: None | Quant = None
 
   @nn.compact
   def __call__(
@@ -80,8 +80,8 @@ class DecoderLayer(nn.Module):
       deterministic,
       model_mode,
       previous_chunk=None,
-      slot: Optional[int] = None,
-      page_state: Optional[page_manager.PageState] = None,
+      slot: None | int = None,
+      page_state: None | page_manager.PageState = None,
   ):
     cfg = self.config
     mesh = self.mesh
@@ -216,8 +216,8 @@ class SequentialBlockDecoderLayers(nn.Module):
       decoder_positions,
       deterministic: bool,
       model_mode,
-      slot: Optional[int] = None,
-      page_state: Optional[page_manager.PageState] = None,
+      slot: None | int = None,
+      page_state: None | page_manager.PageState = None,
   ) -> jnp.ndarray:
     for lyr in range(self.num_decoder_layers):
       inputs = self.decoder_layer(
@@ -245,7 +245,7 @@ class Decoder(nn.Module):
   config: Config
   shared_embedding: nn.Module
   mesh: Mesh
-  quant: Optional[Quant] = None
+  quant: None | Quant = None
   model_mode: str = MODEL_MODE_TRAIN
 
   def setup(self):
@@ -370,6 +370,8 @@ class Decoder(nn.Module):
         return [gpt3.Gpt3DecoderLayer]
       case DecoderBlockType.QWEN3:
         return [qwen3.Qwen3DecoderLayer]
+      case DecoderBlockType.QWEN3_MOE:
+        return [qwen3.Qwen3MoeDecoderLayer]
       case DecoderBlockType.SIMPLE:
         return [simple_layer.SimpleDecoderLayer]
       case DecoderBlockType.SIMPLE_MLP:
@@ -391,9 +393,7 @@ class Decoder(nn.Module):
 
           def map_fn(path, value):
             max_logging.log(f"models.py: Moving parameter {path} to device")
-            return jax.device_put(
-                value, max_utils.device_space()
-            )
+            return jax.device_put(value, max_utils.device_space())
 
           return jax.tree_util.tree_map_with_path(map_fn, variables)
 
@@ -422,6 +422,7 @@ class Decoder(nn.Module):
         DecoderBlockType.GEMMA2,
         DecoderBlockType.GEMMA3,
         DecoderBlockType.QWEN3,
+        DecoderBlockType.QWEN3_MOE,
         DecoderBlockType.SIMPLE,
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
@@ -432,7 +433,9 @@ class Decoder(nn.Module):
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
 
-  def scan_decoder_layers(self, cfg, decoder_layer, length, metadata_axis_name, mesh, in_axes_tuple, model_mode, **kwargs):
+  def scan_decoder_layers(
+      self, cfg, decoder_layer, length, metadata_axis_name, mesh, in_axes_tuple, model_mode, **kwargs
+  ):
     """scan decoder layers, calls `flax.linen.transforms.scan`"""
     initializing = self.is_mutable_collection("params")
     params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
@@ -454,14 +457,7 @@ class Decoder(nn.Module):
         length=length,
         metadata_params={nn.PARTITION_NAME: metadata_axis_name},
     )
-    return scan_fn(
-        config=cfg,
-        mesh=mesh,
-        name=metadata_axis_name,
-        quant=self.quant,
-        model_mode=model_mode,
-        **kwargs
-    )
+    return scan_fn(config=cfg, mesh=mesh, name=metadata_axis_name, quant=self.quant, model_mode=model_mode, **kwargs)
 
   def get_pipeline_stage_module(self, decoder_blocks):
     """get pipeline stage module"""
@@ -608,10 +604,10 @@ class Decoder(nn.Module):
       deterministic=False,
       model_mode=MODEL_MODE_TRAIN,
       previous_chunk=None,
-      slot: Optional[int] = None,
-      page_state: Optional[page_manager.PageState] = None,
-      bidirectional_mask: Optional[Any] = None,
-      image_embeddings: Optional[jnp.ndarray] = None,
+      slot: None | int = None,
+      page_state: None | page_manager.PageState = None,
+      bidirectional_mask: None | Any = None,
+      image_embeddings: None | jnp.ndarray = None,
   ):
     cfg = self.config
     mesh = self.mesh
@@ -759,7 +755,9 @@ class Decoder(nn.Module):
           # Iterate over the two layer groups (dense and MoE) and apply layer transformation
           for layer, num_layers, layer_prefix in zip(layers, num_layers_list, layer_prefixes):
             for index in range(num_layers):
-              y = layer(config=cfg, mesh=mesh, name=f"{layer_prefix}_{index}", quant=self.quant, model_mode=self.model_mode)(
+              y = layer(
+                  config=cfg, mesh=mesh, name=f"{layer_prefix}_{index}", quant=self.quant, model_mode=self.model_mode
+              )(
                   y,
                   decoder_segment_ids,
                   decoder_positions,

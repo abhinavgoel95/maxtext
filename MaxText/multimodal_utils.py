@@ -1,23 +1,20 @@
-"""
-Copyright 2025 Google LLC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023–2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Utils needed by multimodal pipelines for image processing."""
 
 from dataclasses import dataclass
-from typing import List, Tuple, Union, Optional
 from collections import defaultdict
 from itertools import groupby
 import os
@@ -79,14 +76,14 @@ class PreprocessorOutput:
                    images by tiling.
   """
 
-  pixel_values: Optional[np.ndarray] = None
-  aspect_ratios: Optional[np.ndarray] = None
+  pixel_values: None | np.ndarray = None
+  aspect_ratios: None | np.ndarray = None
 
 
 def resize_image(image, model_name):
   """resize image if needed"""
   image_sizes = {
-      #resize for vanilla llama4 support, will be removed once size support is added to multimodal llama4
+      # resize for vanilla llama4 support, will be removed once size support is added to multimodal llama4
       "llama4": (LLAMA4_TILE_SIZE, LLAMA4_TILE_SIZE),
   }
   model_prefix = model_name.split("-")[0]
@@ -187,8 +184,8 @@ def get_best_resolution(img_height, image_width, possible_resolutions, resize_to
 
 def pad_to_best_fit_jax(
     images: np.ndarray,
-    target_size: Tuple[int, int],
-    background_color: Union[int, Tuple[int, ...]] = 0,
+    target_size: tuple[int, int],
+    background_color: int | tuple[int, ...] = 0,
 ) -> np.ndarray:
   """
   Pads and/or crops an image or batch of images to a target size using JAX.
@@ -198,9 +195,9 @@ def pad_to_best_fit_jax(
   Args:
       images (np.ndarray):
           The images to process. Expected shape (..., H, W, C).
-      target_size (Tuple[int, int]):
+      target_size (tuple[int, int]):
           The target (height, width).
-      background_color (Union[int, Tuple[int, ...]], optional):
+      background_color (int | tuple[int, ...] | None):
           The color to use for padding.
           If int, it's used for the first channel and subsequent channels are padded with 0.
           If tuple, its length must match the number of channels in the image.
@@ -425,7 +422,8 @@ def reformat_prompt(prompt, image_placeholder, model_name):
     if not LLAMA4_IMAGE_PLACEHOLDER_IN_PROMPT in prompt:
       prompt = LLAMA4_IMAGE_PLACEHOLDER_IN_PROMPT + prompt
     formatted_prompt = (
-        f"<|begin_of_text|><|header_start|>user<|header_end|>\n\n{prompt}<|eot|><|header_start|>assistant<|header_end|>\n\n"
+        f"<|begin_of_text|><|header_start|>user<|header_end|>\n\n"
+        f"{prompt}<|eot|><|header_start|>assistant<|header_end|>\n\n"
     )
     return formatted_prompt
   else:
@@ -453,11 +451,15 @@ def get_image_offsets(model_name, processor_output: PreprocessorOutput | None):
     assert processor_output.aspect_ratios is not None, "Aspect ratio must be provided for Llama4 image fusion."
     image_height, image_width = LLAMA4_TILE_SIZE, LLAMA4_TILE_SIZE
     downsample_ratio = int(round(1.0 / (LLAMA4_PIXEL_SHUFFLE_RATIO**2)))
-    num_patches_per_chunk = int((image_height // LLAMA4_PATCH_SIZE) * (image_width // LLAMA4_PATCH_SIZE) // downsample_ratio)
+    num_patches_per_chunk = int(
+        (image_height // LLAMA4_PATCH_SIZE) * (image_width // LLAMA4_PATCH_SIZE) // downsample_ratio
+    )
     num_images = processor_output.aspect_ratios.shape[0]
     image_tokens_count = 0
     for image_index in range(num_images):
-      image_tokens_count += get_num_tokens_for_this_image(processor_output.aspect_ratios[image_index], num_patches_per_chunk)
+      image_tokens_count += get_num_tokens_for_this_image(
+          processor_output.aspect_ratios[image_index], num_patches_per_chunk
+      )
     images_offsets = image_tokens_count - num_images
     return images_offsets  # -num_images because replacing every <|image|> tokens.
   else:
@@ -492,7 +494,9 @@ def add_extra_tokens_for_images_llama4(tokens, processor_output: PreprocessorOut
 
   image_height, image_width = LLAMA4_TILE_SIZE, LLAMA4_TILE_SIZE
   downsample_ratio = int(round(1.0 / (LLAMA4_PIXEL_SHUFFLE_RATIO**2)))
-  num_patches_per_chunk = int((image_height // LLAMA4_PATCH_SIZE) * (image_width // LLAMA4_PATCH_SIZE) // downsample_ratio)
+  num_patches_per_chunk = int(
+      (image_height // LLAMA4_PATCH_SIZE) * (image_width // LLAMA4_PATCH_SIZE) // downsample_ratio
+  )
 
   image_index = 0
   for local_image_index, split_part in enumerate(sublists):
@@ -594,7 +598,7 @@ def get_num_tokens_for_this_image(this_aspect_ratio, num_patches_per_chunk):
 
 
 def add_extra_tokens_for_images_gemma3(
-    tokens: np.ndarray | List,
+    tokens: np.ndarray | list,
     *,
     max_num_images: int = 1,
 ):  # -> Int['B L+(max_num_images * (num_tokens_per_image + 3))']:
@@ -647,7 +651,7 @@ def insert_sequence(
     tokens: np.ndarray,
     *,
     at: int,
-    sequence: List[int],
+    sequence: list[int],
     max_num_images: int,
 ) -> np.ndarray:
   """

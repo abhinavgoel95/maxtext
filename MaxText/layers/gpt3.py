@@ -1,24 +1,22 @@
-"""
-Copyright 2023 Google LLC
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023–2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Transformer model definition."""
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import jax
 from jax import lax
@@ -36,7 +34,7 @@ from MaxText.layers import initializers, nnx_wrappers
 from MaxText.layers.linears import mlp_block
 from MaxText.layers import models
 from MaxText.layers import quantizations
-from MaxText.layers.attentions import KVQuant, attention_op_as_linen
+from MaxText.layers.attention_op import KVQuant, attention_op_as_linen
 from MaxText.layers.initializers import Initializer, NdInitializer, nd_dense_init
 from MaxText.layers.linears import dense_general
 from MaxText.layers.quantizations import AqtQuantization as Quant
@@ -55,7 +53,7 @@ class Gpt3LayerNorm(nnx.Module):
       epsilon: float = 1e-6,
       dtype: Any = jnp.float32,
       weight_dtype: Any = jnp.float32,
-      kernel_axes: Tuple[Optional[str], ...] = (),
+      kernel_axes: tuple[None | str, ...] = (),
       scale_init: Initializer = nn.initializers.zeros,
       use_bias: bool = True,
       reductions_in_fp32: bool = False,
@@ -115,12 +113,12 @@ def gpt3_layer_norm(
     epsilon: float = 1e-6,
     dtype: Any = jnp.float32,
     weight_dtype: Any = jnp.float32,
-    kernel_axes: Tuple[Optional[str], ...] = (),
+    kernel_axes: tuple[None | str, ...] = (),
     scale_init: Initializer = nn.initializers.zeros,
     use_bias: bool = True,
     reductions_in_fp32: bool = False,
     parameter_memory_host_offload: bool = False,
-    name: Optional[str] = None,
+    name: None | str = None,
 ):
   """Initializes the gpt3_layer_norm module.
 
@@ -195,8 +193,8 @@ class Gpt3MultiHeadAttention(nn.Module):
   float32_qk_product: bool = False  # computes logits in float32 for stability.
   float32_logits: bool = True  # cast logits in float32 for stability.
   fused_qkv: bool = True
-  quant: Optional[Quant] = None
-  kv_quant: Optional[KVQuant] = None
+  quant: None | Quant = None
+  kv_quant: None | KVQuant = None
   use_bias: bool = True
 
   input_axis_names: AxisNames = (BATCH, LENGTH, EMBED)
@@ -322,7 +320,7 @@ class Gpt3DecoderLayer(nn.Module):
   config: models.Config
   mesh: Mesh
   model_mode: str
-  quant: Optional[Quant] = None
+  quant: None | Quant = None
 
   @nn.compact
   def __call__(

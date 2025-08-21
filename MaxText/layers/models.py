@@ -1,22 +1,20 @@
-#  Copyright 2023 Google LLC
+# Copyright 2023–2025 Google LLC
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#       https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Transformer models."""
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
-
-from typing import Optional
 
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -51,9 +49,8 @@ class Transformer(nn.Module):
   # We generally use MaxText.common_types.MODEL_MODE_TRAIN or
   # MaxText.common_types.MODEL_MODE_PREFILL for initializations here.
   # TODO: Make model_mode required after confirming no users are affected.
-  model_mode: str = MODEL_MODE_TRAIN # May be different than the model_mode passed to __call__
+  model_mode: str = MODEL_MODE_TRAIN  # May be different than the model_mode passed to __call__
   # pylint: enable=attribute-defined-outside-init
-
 
   def setup(self):
     """Initialize shared_embedding & decoder layers."""
@@ -89,15 +86,15 @@ class Transformer(nn.Module):
       decoder_input_tokens: jnp.ndarray,
       decoder_positions: jnp.ndarray,
       decoder_segment_ids=None,
-      encoder_images: Optional[jnp.ndarray] = None,
+      encoder_images: None | jnp.ndarray = None,
       enable_dropout=True,
       model_mode=MODEL_MODE_TRAIN,
       previous_chunk=None,
-      true_length: Optional[int] = None,
-      slot: Optional[int] = None,
-      page_state: Optional[page_manager.PageState] = None,
-      decoder_target_tokens: Optional[jnp.ndarray] = None,
-      decoder_target_mask: Optional[jnp.ndarray] = None,
+      true_length: None | int = None,
+      slot: None | int = None,
+      page_state: None | page_manager.PageState = None,
+      decoder_target_tokens: None | jnp.ndarray = None,
+      decoder_target_mask: None | jnp.ndarray = None,
   ):
     """Applies Transformer decoder-branch on encoded-input and target.
 
@@ -193,7 +190,7 @@ class ZeroOneTransformer(nn.Module):
   # We generally use MaxText.common_types.MODEL_MODE_TRAIN or
   # MaxText.common_types.MODEL_MODE_PREFILL for initializations here.
   # TODO: Make model_mode required after confirming no users are affected.
-  model_mode: str = MODEL_MODE_TRAIN # May be different than the model_mode passed to __call__
+  model_mode: str = MODEL_MODE_TRAIN  # May be different than the model_mode passed to __call__
 
   def setup(self):
     self.model = Transformer(self.config, self.mesh, self.quant, self.model_mode)
@@ -203,16 +200,16 @@ class ZeroOneTransformer(nn.Module):
       decoder_input_tokens: jnp.ndarray,
       decoder_positions: jnp.ndarray,
       decoder_segment_ids=None,
-      encoder_images: Optional[jnp.ndarray] = None,
+      encoder_images: None | jnp.ndarray = None,
       enable_dropout=True,
       model_mode=MODEL_MODE_TRAIN,
       previous_chunk=None,
-      true_length: Optional[int] = None,
-      slot: Optional[int] = None,
-      page_state: Optional[page_manager.PageState] = None,
+      true_length: None | int = None,
+      slot: None | int = None,
+      page_state: None | page_manager.PageState = None,
       partition_spec=None,
-      decoder_target_tokens: Optional[jnp.ndarray] = None,
-      decoder_target_mask: Optional[jnp.ndarray] = None,
+      decoder_target_tokens: None | jnp.ndarray = None,
+      decoder_target_mask: None | jnp.ndarray = None,
   ):
     if self.is_initializing():
       return self.model(

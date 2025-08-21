@@ -1,16 +1,16 @@
-#  Copyright 2025 Google LLC
+# Copyright 2023–2025 Google LLC
 #
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#       https://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 
 """MoE related Layers."""
@@ -37,12 +37,49 @@ from MaxText.kernels import megablox as mblx
 from MaxText.layers import attentions, linears, quantizations, nnx_wrappers
 from MaxText.layers.initializers import NdInitializer, nd_dense_init, default_bias_init, variable_to_logically_partitioned
 
+import qwix.pallas as qpl
 
 set_xla_metadata = xla_metadata.set_xla_metadata
 
 
 DISPATCH = "dispatch"
 COMBINE = "combine"
+
+
+@jax.custom_vjp
+def _sort_activations(inputs: jax.Array, sort_indices: jax.Array) -> jax.Array:
+  """Sort activations by `sort_indices`.
+
+  Critially, we assume that the backward-pass gradient is computed by the 
+  unsort operation which simply has `jnp.argsort(sort_indices)` as its sort
+  indices. 
+ 
+  Args:
+    inputs: `(tokens, ...)`-shaped array of input activations to sort.
+    sort_indices: `(tokens,)`-shaped array containing the sort order.
+
+  Returns:
+    `(tokens, ...)`-shaped array of input activations sorted by `sort_indices`.
+  """
+  assert inputs.shape[0] == sort_indices.shape[0]
+
+  with jax.named_scope("sort_activations"):
+    return inputs[sort_indices, ...]
+
+
+def _sort_activations_fwd(inputs: jax.Array, sort_indices: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+  """Forward pass of the custom vjp for `_sort_activations()`."""
+  return _sort_activations(inputs, sort_indices), sort_indices
+
+
+def _sort_activations_bwd(residuals: jax.Array, grads: jax.Array
+) -> tuple[jax.Array, None]:
+  """Backward pass of the custom vjp for `_sort_activations()`."""
+  sort_indices = residuals
+  return _sort_activations(grads, jnp.argsort(sort_indices)), None
+
+_sort_activations.defvjp(_sort_activations_fwd, _sort_activations_bwd)
 
 
 def random_routing(rng_key, gate_logits, num_experts_per_tok):
@@ -341,6 +378,11 @@ class RoutedMoE(nnx.Module):
       top_k_weights = self.deepseek_scale_weights(top_k_weights)
     elif self.config.decoder_block != ctypes.DecoderBlockType.LLAMA4:
       top_k_weights = jax.nn.softmax(top_k_weights.astype(jnp.float32), axis=-1).astype(self.dtype)
+
+    # This is the Qwen3-specific normalization of router weights.
+    if self.config.norm_topk_prob:
+      top_k_weights /= top_k_weights.sum(axis=-1, keepdims=True)
+
     return top_k_weights, top_k_indices
 
   def deepseek_scale_weights(self, weights):
@@ -400,13 +442,13 @@ class RoutedMoE(nnx.Module):
     pre_bias logits.
 
     Args:
-      gate_logits: Array of shape `(..., num_experts)`.
-      pre_bias_logits: Array of shape `(..., num_experts)`.
+      gate_logits: Array of shape `(batch, seq, num_experts)`.
+      pre_bias_logits: Array of shape `(batch, seq,num_experts)`.
 
     Returns:
-      - top_k_weights: `(..., num_experts_per_tok)` array of weight values for
+      - top_k_weights: `(batch, seq, num_experts_per_tok)` array of weight values for
         each selected expert.
-      - top_k_indices: `(..., num_experts_per_tok)` array of indices
+      - top_k_indices: `(batch, seq, num_experts_per_tok)` array of indices
         identifying the selected experts for each token.
     """
     expert_mask = 1 if self.config.n_routing_groups == -1 else self.expert_group_mask(gate_logits)
@@ -435,7 +477,10 @@ class RoutedMoE(nnx.Module):
     sorted_selected_experts = jnp.argsort(flatten_selected_experts)
     sorted_indices = sorted_selected_experts // self.num_experts_per_tok
     # sort inputs for number of selected experts
-    sorted_inputs = jnp.take(inputs_2d, indices=sorted_indices, axis=0).astype(self.dtype)
+    replicated_inputs_2d = jnp.reshape(
+        jnp.broadcast_to(inputs_2d[None, ...], (self.num_experts_per_tok, *inputs_2d.shape)), 
+        (self.num_experts_per_tok * inputs_2d.shape[0], inputs_2d.shape[1]))
+    sorted_inputs = _sort_activations(replicated_inputs_2d, sorted_indices).astype(self.dtype)
     group_size = jnp.bincount(flatten_selected_experts, length=self.num_experts)
     # Return the experts for each sorted input.
     expert_indices = jnp.arange(self.num_experts)
@@ -462,7 +507,7 @@ class RoutedMoE(nnx.Module):
   ):
     """Unpermute tokens to original order and combine weights."""
 
-    unsort_intermediate = jnp.take(intermediate, indices=jnp.argsort(sorted_selected_experts), axis=0)
+    unsort_intermediate = _sort_activations(intermediate, jnp.argsort(sorted_selected_experts))
     reshaped_weights = jnp.reshape(weights, (-1, self.num_experts_per_tok))
     reshaped_intermediate = jnp.reshape(
         unsort_intermediate,
@@ -558,7 +603,7 @@ class RoutedMoE(nnx.Module):
       expert_indices = jnp.repeat(base_indices, local_sizes, total_repeat_length=inputs.shape[0])
 
     sorted_indices = jnp.argsort(expert_indices)
-    sorted_inputs = jnp.take(inputs, indices=sorted_indices, axis=0)
+    sorted_inputs = _sort_activations(inputs, sorted_indices)
     sorted_experts_ids = expert_indices[sorted_indices]
     return (
         sorted_inputs,
@@ -691,7 +736,11 @@ class RoutedMoE(nnx.Module):
         quant_dg = self.quant.quant_dg
         lhs_quantize_dtype = quant_dg.fwd.dg_quantizer.lhs.numerics.get_dtype()
         rhs_quantize_dtype = quant_dg.fwd.dg_quantizer.rhs.numerics.get_dtype()
-
+      if self.config.use_qwix_quantization:
+        quantization_rule = qpl.get_current_rule("dot_general")
+        if quantization_rule is not None:
+          lhs_quantize_dtype = quantization_rule.act_qtype
+          rhs_quantize_dtype = quantization_rule.weight_qtype
       m, k, n = inputs.shape[0], inputs.shape[1], kernel.shape[2]
       tiling = (
           min(tile_size[0], m),
@@ -707,6 +756,7 @@ class RoutedMoE(nnx.Module):
             tiling=tiling,
             lhs_quantize_dtype=lhs_quantize_dtype,
             rhs_quantize_dtype=rhs_quantize_dtype,
+            use_qwix_quantization=self.config.use_qwix_quantization,
         )
       else:
         rhs_inputs = kernel
@@ -889,11 +939,7 @@ class RoutedMoE(nnx.Module):
         )
         if is_batch_sharded_by_expert:
           # locally unpermute back to the original order
-          local_output = jnp.take(
-              intermediate_output,
-              indices=jnp.argsort(local_sorted_indices),  # pylint: disable=undefined-variable
-              axis=0,
-          )
+          local_output = _sort_activations(intermediate_output, jnp.argsort(local_sorted_indices)) # pylint: disable=undefined-variable
           input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
               jnp.transpose(all_shards_group_sizes),  # pylint: disable=undefined-variable
               expert_shard_id,
@@ -1169,7 +1215,9 @@ class RoutedMoE(nnx.Module):
       einsum_op = jnp.einsum
     return einsum_op
 
-  def maybe_all_gather_kernel_weight_in_expert_parallelism(self, kernel: jax.Array, kernel_axes: Tuple[Optional[str], ...]):
+  def maybe_all_gather_kernel_weight_in_expert_parallelism(
+      self, kernel: jax.Array, kernel_axes: Tuple[Optional[str], ...]
+  ):
     """All-gather kernel weight in expert parallelism if needed."""
     if self.get_expert_parallelism_size() > 1:
       # This will trigger all-gather using weight_dtype

@@ -74,13 +74,14 @@ from dotenv import load_dotenv  # If this is not available, try ``pip install py
 
 load_dotenv()
 import os, logging, sys
-from llm_agent import GeminiAgent
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from orchestration_agent.Utils import parse_python_code
+# What the root dir for running these scripts? Do you have to add this line?
 
-from prompt_code_generation import CodeGeneration
+from code_generation_agent.llm_agent import GeminiAgent  
+from orchestration_agent.Utils import parse_python_code
+from code_generation_agent.prompt_code_generation import CodeGeneration  
 import argparse
 
 # Set up basic configuration

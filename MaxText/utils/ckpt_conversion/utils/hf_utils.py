@@ -1,10 +1,10 @@
-# Copyright 2025 Google LLC
+# Copyright 2023–2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#    https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,8 +15,6 @@
 """
 Utility functions to support the HF checkpoint conversion and verification process in test_hf.py.
 """
-
-from typing import Optional
 
 import numpy as np
 
@@ -30,7 +28,7 @@ import torch
 from tabulate import tabulate
 
 
-def convert_jax_weight_to_torch(weight: "jax.Array", dtype: Optional[str] = None) -> torch.Tensor:
+def convert_jax_weight_to_torch(weight: "jax.Array", dtype: None | str = None) -> torch.Tensor:
   expected_dtype = str(weight.dtype) if dtype is None else dtype
   expected_shape = weight.shape
   weight = multihost_utils.process_allgather(weight)
@@ -49,8 +47,8 @@ def check_arrays_match(arrayA, arrayB, atol=0.01, rtol=1e-5):
   the specified tolerance, it prints detailed information about the mismatches.
 
   Args:
-      arrayA (Union[torch.Tensor, jax.Array]): First set of arrays to compare
-      arrayB (Union[torch.Tensor, jax.Array]): Second set of arrays to compare
+      arrayA (torch.Tensor | jax.Array): First set of arrays to compare
+      arrayB (torch.Tensor | jax.Array): Second set of arrays to compare
       atol (float, optional): Absolute tolerance for comparison. Defaults to 0.01.
       rtol (float, optional): Relative tolerance for comparison. Defaults to 1e-5.
 
@@ -132,7 +130,8 @@ def check_predicted_tokens_match(logits_a, logits_b, tolerance=0.1):
 
   if disagreement_rate > tolerance:
     raise AssertionError(
-        f"Token prediction mismatch: {disagreement_rate:.1%} of tokens disagree " f"(exceeds tolerance of {tolerance:.1%})"
+        f"Token prediction mismatch: {disagreement_rate:.1%} of tokens disagree "
+        f"(exceeds tolerance of {tolerance:.1%})"
     )
 
 
