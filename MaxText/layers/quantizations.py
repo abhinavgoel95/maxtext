@@ -854,7 +854,7 @@ class TransformerEngineQuantization(Quantization):
       warnings.warn("TE layernorm_mlp is only supported when 'fused_mlp' is enabled in the config and MlpBlock.use_pre_norm is True. TE's GEMMs will still be used but TE's fused norm+quantize and fused activations+quantize will not be used.")
       return None
 
-    def layernorm_mlp_fn(generate_quantizer_set, inputs, dot_1_input_axes):
+    def layernorm_mlp_fn(generate_quantizer_set, inputs, dot_1_input_axes, dot_2_input_axes):
       from transformer_engine.jax.layernorm_mlp import layernorm_mlp
       dense_layer_names = ['wi', 'wo']
       dense_layers = [getattr(mlp_block, name) for name in dense_layer_names]
@@ -869,6 +869,7 @@ class TransformerEngineQuantization(Quantization):
         zero_centered_gamma=False,
         epsilon=mlp_block.mlp_layer_norm.epsilon,
         dot_1_input_axes=dot_1_input_axes,
+        dot_2_input_axes=dot_2_input_axes,
         ffn1_ckpt_name="mlpwi",
         ffn2_ckpt_name="mlpwo",
         activation_type=mlp_block.activations,

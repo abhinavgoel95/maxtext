@@ -431,9 +431,10 @@ class MlpBlock(nnx.Module):
       # Placeholder inputs, actual values including sharding axes don't matter as the modules
       # do not initialize any parameters. The modules only initialize variables for recipe state (e.g. amax_history + scale for Delayed Scaling)
       dummy_dot_1_input_axes = ("activation_batch", "activation_norm_length", "activation_embed")
+      dummy_dot_2_input_axes= ("activation_batch", "activation_length", "activation_mlp")
       block_size = getattr(quant, "get_block_size", lambda: 1)()
       dummy_inputs = jnp.zeros((1, block_size, in_features), dtype=self.dtype)
-      self.te_ln_mlp = self.te_ln_mlp.lazy_init(dummy_inputs, dummy_dot_1_input_axes)
+      self.te_ln_mlp = self.te_ln_mlp.lazy_init(dummy_inputs, dummy_dot_1_input_axes, dummy_dot_2_input_axes)
 
   def get_norm_layer(self, num_features: int):
     """get normalization layer."""
@@ -467,13 +468,15 @@ class MlpBlock(nnx.Module):
       dot_1_input_axes = ("activation_batch",
                           "prefill_activation_norm_length",
                           "activation_embed")
+      dot_2_input_axes = ("activation_batch", "prefill_activation_length", "activation_mlp")
     else:
       dot_1_input_axes = ("activation_batch",
                           "activation_norm_length",
                           "activation_embed")
+      dot_2_input_axes = ("activation_batch", "activation_length", "activation_mlp")
 
     if self.te_ln_mlp is not None:
-      return self.te_ln_mlp(inputs, dot_1_input_axes)
+      return self.te_ln_mlp(inputs, dot_1_input_axes, dot_2_input_axes)
 
     if self.mlp_layer_norm is not None:
       inputs = self.mlp_layer_norm(inputs)
@@ -503,10 +506,7 @@ class MlpBlock(nnx.Module):
     x = functools.reduce(operator.mul, activations).astype(self.dtype)
     # Apply dropout and final dense output projection.
     x = self.dropout(x, deterministic=deterministic)  # Broadcast along length.
-    if self.model_mode == MODEL_MODE_PREFILL:
-      x = nn.with_logical_constraint(x, ("activation_batch", "prefill_activation_length", "activation_mlp"))
-    else:
-      x = nn.with_logical_constraint(x, ("activation_batch", "activation_length", "activation_mlp"))
+    x = nn.with_logical_constraint(x, dot_2_input_axes)
     output = self.wo(x)
 
     output = checkpoint_name(output, "mlpwo")
