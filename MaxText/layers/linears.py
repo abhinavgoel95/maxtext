@@ -393,6 +393,7 @@ class MlpBlock(nnx.Module):
           quant=self.quant if self.te_ln_mlp is None else None,
           use_bias=self.use_bias,
           matmul_precision=self.config.matmul_precision,
+          using_global_amax_of_x=True,
           rngs=rngs,
       )
     else:
@@ -409,6 +410,7 @@ class MlpBlock(nnx.Module):
             quant=self.quant if self.te_ln_mlp is None else None,
             use_bias=self.use_bias,
             matmul_precision=self.config.matmul_precision,
+            using_global_amax_of_x=True,
             rngs=rngs,
         )
         setattr(self, dense_name, module)
