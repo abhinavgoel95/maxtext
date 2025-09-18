@@ -52,7 +52,7 @@ _TILE_SIZE = "tile_size"  # Tile size for subchannel
 class Quantization:
   """Base class for quantization configurations"""
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), using_global_amax_of_x: bool = False):
     """Placeholder for dot_general implementation in subclasses."""
 
   def einsum(self, dtype: DType = jnp.float32):
@@ -147,7 +147,7 @@ class AqtQuantization:
         _rhs_axis_metadata_wrapper, mesh_axes=mesh_axes, is_tiled=is_tiled, replicate_scale=replicate_scale
     )
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), using_global_amax_of_x: bool = False):
     """Returns dot_general configured with aqt params."""
     if isinstance(self.quant_dg, dict):
       quant_dg, is_tiled, tiling_fn = self._get_mixed_precision_cfg()
@@ -200,7 +200,7 @@ class Fp8Quantization(Quantization):
 
   quant_mode = "train"
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), using_global_amax_of_x: bool = False):
     """Returns dot_general configured with aqt params."""
     return nn.Fp8DirectDotGeneralOp
 
@@ -292,7 +292,7 @@ class NANOOFp8Quantization(Quantization):
 
   quant_mode = "train"
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), using_global_amax_of_x: bool = False):
     """Returns dot_general configured with aqt params."""
     return nn.NANOOFp8DotGeneralOp
 
@@ -810,7 +810,7 @@ class TransformerEngineQuantization(Quantization):
 
     return TEWrapper
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), using_global_amax_of_x: bool = False):
     """Placeholder for dot_general implementation in subclasses."""
     import transformer_engine.jax as te
 
@@ -824,6 +824,7 @@ class TransformerEngineQuantization(Quantization):
         kernel,
         contracting_dims=contracting_dims,
         quantizer_set=quantizer_set,
+        using_global_amax_of_x=using_global_amax_of_x
       )
 
     return self._wrap(te_dot_general, "dot_general")
