@@ -52,7 +52,7 @@ _TILE_SIZE = "tile_size"  # Tile size for subchannel
 class Quantization:
   """Base class for quantization configurations"""
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), **kwargs):
     """Placeholder for dot_general implementation in subclasses."""
 
   def einsum(self, dtype: DType = jnp.float32):
@@ -147,7 +147,7 @@ class AqtQuantization:
         _rhs_axis_metadata_wrapper, mesh_axes=mesh_axes, is_tiled=is_tiled, replicate_scale=replicate_scale
     )
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), **kwargs):
     """Returns dot_general configured with aqt params."""
     if isinstance(self.quant_dg, dict):
       quant_dg, is_tiled, tiling_fn = self._get_mixed_precision_cfg()
@@ -200,7 +200,7 @@ class Fp8Quantization(Quantization):
 
   quant_mode = "train"
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), **kwargs):
     """Returns dot_general configured with aqt params."""
     return nn.Fp8DirectDotGeneralOp
 
@@ -292,7 +292,7 @@ class NANOOFp8Quantization(Quantization):
 
   quant_mode = "train"
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), **kwargs):
     """Returns dot_general configured with aqt params."""
     return nn.NANOOFp8DotGeneralOp
 
@@ -810,13 +810,15 @@ class TransformerEngineQuantization(Quantization):
 
     return TEWrapper
 
-  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
+  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = (), **kwargs):
     """Placeholder for dot_general implementation in subclasses."""
     import transformer_engine.jax as te
 
-    def te_dot_general(generate_quantizer_set, x, kernel, dims, **kwargs):
+    def te_dot_general(generate_quantizer_set, x, kernel, dims, **inner_kwargs):
       contracting_dims, batch_dims = dims
       assert batch_dims == ((), ()), "Batch dimensions must be empty for TransformerEngine dot."
+
+      using_global_amax_of_x = kwargs.get('using_global_amax_of_x', False)
 
       quantizer_set = generate_quantizer_set()
       return te.dense.dense(
@@ -824,6 +826,7 @@ class TransformerEngineQuantization(Quantization):
         kernel,
         contracting_dims=contracting_dims,
         quantizer_set=quantizer_set,
+        using_global_amax_of_x=using_global_amax_of_x
       )
 
     return self._wrap(te_dot_general, "dot_general")
