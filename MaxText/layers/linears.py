@@ -104,7 +104,6 @@ class DenseGeneral(nnx.Module):
       use_bias: bool = False,
       matmul_precision: str = "default",
       parameter_memory_host_offload: bool = False,
-      using_global_amax_of_x: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -165,7 +164,7 @@ class DenseGeneral(nnx.Module):
       self.bias = None
 
     if quant:
-      dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes, using_global_amax_of_x=using_global_amax_of_x)
+      dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes)
       dot_general_linen = dot_general_cls()
       quant_dot_general = nnx_wrappers.ToNNX(dot_general_linen, rngs=rngs)
       self._quant_dot_general_name = f"{type(dot_general_linen).__name__}_0"
@@ -393,7 +392,6 @@ class MlpBlock(nnx.Module):
           quant=self.quant if self.te_ln_mlp is None else None,
           use_bias=self.use_bias,
           matmul_precision=self.config.matmul_precision,
-          using_global_amax_of_x=True,
           rngs=rngs,
       )
     else:
@@ -410,7 +408,6 @@ class MlpBlock(nnx.Module):
             quant=self.quant if self.te_ln_mlp is None else None,
             use_bias=self.use_bias,
             matmul_precision=self.config.matmul_precision,
-            using_global_amax_of_x=True,
             rngs=rngs,
         )
         setattr(self, dense_name, module)

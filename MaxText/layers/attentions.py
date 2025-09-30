@@ -530,7 +530,6 @@ class Attention(nnx.Module):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
-        using_global_amax_of_x=True,
         rngs=self.rngs,
     )
 
@@ -571,7 +570,6 @@ class Attention(nnx.Module):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
-        using_global_amax_of_x=True,
         rngs=self.rngs,
     )
 
