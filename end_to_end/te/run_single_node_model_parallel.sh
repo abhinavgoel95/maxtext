@@ -157,7 +157,7 @@ trap restore_model_config_file EXIT
 
 BASE_ARGS="--model $MODEL --steps $STEPS"
 # Need to be with four escape quotes
-OTHER_ARGS="--additional-args=\"\"\"fused_mlp=true shardy=false ${PROFILE_ARG}\"\"\""
+OTHER_ARGS="--additional-args=\"\"\"fused_mlp=true ${PROFILE_ARG}\"\"\""
 TRAINING_RECIPES=("fp8" "te_fp8_delayedscaling" "te_mxfp8")   # fp8 is the MaxText baseline
 
 export NVTE_JAX_CUSTOM_CALLS='NormFwdPrimitive=false,NormBwdPrimitive=false'
