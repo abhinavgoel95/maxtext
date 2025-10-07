@@ -186,7 +186,7 @@ for ((i = start_index; i < ${#experiments[@]}; i++)); do
   for recipe in "${TRAINING_RECIPES[@]}"; do
     test="${recipe}"
     run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
-      "PYTHONPATH=${MAXTEXT_DIR} MAXTEXT_DIR=${MAXTEXT_DIR} bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --quantization=${recipe} $BASE_ARGS ${OTHER_ARGS}"
+      "MAXTEXT_DIR=${MAXTEXT_DIR} bash test-maxtext.sh $args --quantization=${recipe} $BASE_ARGS ${OTHER_ARGS}"
   done
 done
 
