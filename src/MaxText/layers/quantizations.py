@@ -864,7 +864,7 @@ class TransformerEngineQuantization(Quantization):
         dot_2_input_axes=dot_2_input_axes,
         ffn1_ckpt_name="mlpwi",
         ffn2_ckpt_name="mlpwo",
-        activation_type=mlp_block.activations,
+        activation_type=tuple(mlp_block.activations),
         quantizer_sets=[generate_quantizer_set(postfix=name) for name in dense_layer_names],
       )
 
