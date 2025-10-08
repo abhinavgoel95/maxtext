@@ -260,7 +260,6 @@ class Decoder(nn.Module):
           config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy
       )
 
-  # TODO(Phuong): verify that this minimal_policy works correctly with TE custom calls
   def minimal_policy(self, with_context=False):
     """Helper for creating minimal checkpoint policies."""
     names = [
