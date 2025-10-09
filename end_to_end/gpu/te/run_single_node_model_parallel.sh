@@ -1,3 +1,8 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
+
+# Run MaxText with Transformer Engine (TE) across different parallelization strategies and quantization recipes
+# Usage: bash run_single_node_model_parallel.sh --model MODEL --output-dir-tag OUTPUT_DIR_TAG --trace true|false --steps STEPS --single-gpu-run true|false --num-decoder-layers N_LAYERS
+
 #!/bin/bash
 set -euo pipefail
 
@@ -67,38 +72,35 @@ fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-MAXTEXT_DIR="$(realpath "$SCRIPT_DIR/../../")"
+MAXTEXT_DIR="$(realpath "$SCRIPT_DIR/../../../")"
 OUTPUT_DIR="${SCRIPT_DIR}/output/${MODEL}${NUM_DECODER_LAYERS:+_${NUM_DECODER_LAYERS}_layers}${OUTPUT_DIR_TAG:+_$OUTPUT_DIR_TAG}_${TIMESTAMP}"
 mkdir -p "$OUTPUT_DIR"
 
 n_gpus=$(nvidia-smi -L | wc -l)
 half_gpus=$((n_gpus / 2))
-# List of experiments: <DP> <TP> <TPSP> <FSDP>
+# List of experiments: <DP> <TPSP> <FSDP>
 experiments=(
-  "1        1           1           1"        # Single GPU
-  "1        $n_gpus     1           1"        # Single DP, full TP
-  "$n_gpus  1           1           1"        # Full DP, single TP
-  "2        $half_gpus  1           1"        # DP=2, TP=half GPUs
-  "1        1           $n_gpus     1"        # Sequence parallelism maxed
-  "2        1           $half_gpus  1"        # DP=2, TPSP=half GPUs
-  "1        1           1           $n_gpus"  # FSDP across all GPUs
-  "1        1           $half_gpus  2"        # FSDP=2, TPSP=half GPUs
+  "1        1           1"        # Single GPU
+  "$n_gpus  1           1"        # Full DP
+  "1        $n_gpus     1"        # Full TPSP
+  "2        $half_gpus  1"        # DP=2, TPSP=half GPUs
+  "1        1           $n_gpus"  # Full FSDP
+  "1        $half_gpus  2"        # FSDP=2, TPSP=half GPUs
 )
 
 CSV="$OUTPUT_DIR/raw_results.csv"
-echo -e "test\tdp\ttp\ttpsp\tfsdp\tmean\tstddev" > "$CSV"
+echo -e "test\tdp\ttpsp\tfsdp\tmean\tstddev" > "$CSV"
 
 run_and_parse() {
   local test="$1"
   local dp="$2"
-  local tp="$3"
-  local tpsp="$4"
-  local fsdp="$5"
+  local tpsp="$3"
+  local fsdp="$4"
   set +e
-  local cmd="$6"
+  local cmd="$5"
   set -e
-  local stdout="$OUTPUT_DIR/run_${test}_dp${dp}_tp${tp}_tpsp${tpsp}_fsdp${fsdp}.log"
-  echo "===== Executing ${test}\t${dp}\t${tp}\t${tpsp}\t${fsdp} ====="
+  local stdout="$OUTPUT_DIR/run_${test}_dp${dp}_tpsp${tpsp}_fsdp${fsdp}.log"
+  echo "===== Executing ${test}\t${dp}\t${tpsp}\t${fsdp} ====="
   eval "$cmd" 2>&1 | tee "$stdout"
   # Exclude the warning steps for warning up and last step for tracing
   ths=$(grep 'Tokens/s/device:' "$stdout" | sed '1,'"${WARMUP_STEPS}"'d;$d' | awk -F'Tokens/s/device: ' '{print $2}' | awk -F',' '{print $1}')
@@ -118,16 +120,16 @@ else:
     mean=$(echo "$mean_stddev" | cut -f1)
     stddev=$(echo "$mean_stddev" | cut -f2)
   fi
-  echo -e "${test}\t${dp}\t${tp}\t${tpsp}\t${fsdp}\t${mean}\t${stddev}" >> "$CSV"
+  echo -e "${test}\t${dp}\t${tpsp}\t${fsdp}\t${mean}\t${stddev}" >> "$CSV"
 
   if [[ "$TRACE" == "true" ]]; then
     TRACE_SRC=$(grep -oE '/tmp/tmp\.[^ ]+' "$stdout" | head -n1)
     if [[ -n "$TRACE_SRC" && -e "$TRACE_SRC" ]]; then
-      TRACE_DEST="${OUTPUT_DIR}/trace_${test}_dp${dp}_tp${tp}_tpsp${tpsp}_fsdp${fsdp}"
+      TRACE_DEST="${OUTPUT_DIR}/trace_${test}_dp${dp}_tpsp${tpsp}_fsdp${fsdp}"
       mv "$TRACE_SRC" "$TRACE_DEST"
       echo " === Trace moved: $TRACE_SRC -> $TRACE_DEST"
     else
-      echo "=== No trace file found for $test, dp=$dp, tp=$tp, tpsp=$tpsp, fsdp=$fsdp"
+      echo "=== No trace file found for $test, dp=$dp, tpsp=$tpsp, fsdp=$fsdp"
     fi
   fi
 }
@@ -140,7 +142,7 @@ if [[ "$TRACE" == "true" ]]; then
 fi
 # Updating the model config file as we can't pass base_num_decoder_layers=1 in additional-args
 if [ -n "$NUM_DECODER_LAYERS" ]; then
-  MODEL_CONFIG="$MAXTEXT_DIR/MaxText/configs/models/$MODEL.yml"
+  MODEL_CONFIG="$MAXTEXT_DIR/src/MaxText/configs/models/$MODEL.yml"
   original_num_decoder_layers=$(grep "base_num_decoder_layers" "$MODEL_CONFIG" | awk -F': ' '{print $2}')
   sed -i "s/base_num_decoder_layers: .*/base_num_decoder_layers: $NUM_DECODER_LAYERS/" "$MODEL_CONFIG"
   echo "=== Setting base_num_decoder_layers=$NUM_DECODER_LAYERS in $MODEL_CONFIG"
@@ -170,9 +172,9 @@ fi
 for ((i = start_index; i < ${#experiments[@]}; i++)); do
   exp="${experiments[$i]}"
   echo "Running experiment: $exp"
-  read dp tp tpsp fsdp <<< "$exp"
+  read dp tpsp fsdp <<< "$exp"
 
-  n_used_gpus=$((dp * tp * tpsp * fsdp))
+  n_used_gpus=$((dp * tpsp * fsdp))
   if (( n_used_gpus > n_gpus )); then
     echo "Error: requested $n_used_gpus GPUs, but only $n_gpus are available."
     exit 1
@@ -181,14 +183,14 @@ for ((i = start_index; i < ${#experiments[@]}; i++)); do
   export CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
   echo "=== Using GPUs: $CUDA_VISIBLE_DEVICES"
 
-  args="--data-parallel=$dp --tensor-parallel=$tp --tensor-sequence-parallel=$tpsp --fsdp=$fsdp"
+  args="--data-parallel=$dp --tensor-sequence-parallel=$tpsp --fsdp=$fsdp"
 
   for recipe in "${TRAINING_RECIPES[@]}"; do
     test="${recipe}"
-    run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
+    run_and_parse "$test" "$dp" "$tpsp" "$fsdp" \
       "MAXTEXT_DIR=${MAXTEXT_DIR} bash test-maxtext.sh $args --quantization=${recipe} $BASE_ARGS ${OTHER_ARGS}"
+    done
   done
-done
 
 
 OUTPUT_FORMAT="txt" # txt or csv

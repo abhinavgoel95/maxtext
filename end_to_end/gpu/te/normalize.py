@@ -1,3 +1,9 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
+
+# Normalize the raw results to get the percentage difference from the baseline
+# Usage: python normalize.py input_raw_results.csv output_summary.{csv|txt} format
+#   format = 'csv' for comma-separated, 'txt' or 'tsv' for tab-separated
+
 import csv
 import sys
 
@@ -19,7 +25,7 @@ with open(input_csv) as f:
     for row in reader:
         key = tuple(
             row.get(k) if row.get(k) not in [None, ""] else "NA"
-            for k in ["dp", "tp", "tpsp", "fsdp"]
+            for k in ["dp", "tpsp", "fsdp"]
         )
         if not row.get("test"):
             continue
@@ -28,7 +34,7 @@ with open(input_csv) as f:
             key_order.append(key)  # remember when first seen
         data[key][row["test"]] = row
 
-header = ["test", "dp", "tp", "tpsp", "fsdp", "mean", "stddev", "normalized"]
+header = ["test", "dp", "tpsp", "fsdp", "mean", "stddev", "normalized"]
 rows = []
 
 # iterate keys in first-seen order
@@ -63,7 +69,6 @@ for key in key_order:
             [
                 testname,
                 row["dp"],
-                row["tp"],
                 row["tpsp"],
                 row["fsdp"],
                 mean,

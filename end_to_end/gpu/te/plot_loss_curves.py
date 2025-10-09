@@ -1,3 +1,8 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
+
+# Plot loss curves from training logs
+# Usage: python plot_loss_curves.py logdir
+
 import re
 import os
 import sys
@@ -39,18 +44,18 @@ def main(args):
     log_files = [os.path.join(logdir, f) for f in os.listdir(logdir) if os.path.isfile(os.path.join(logdir, f)) and f.endswith('.log')]
 
     # Extract parallelism configs from filenames
-    config_pattern = re.compile(r'dp(\d+)_tp(\d+)_tpsp(\d+)_fsdp(\d+)')
+    config_pattern = re.compile(r'dp(\d+)_tpsp(\d+)_fsdp(\d+)')
     configs = {}
     for log_file in log_files:
         fname = os.path.basename(log_file)
         match = config_pattern.search(fname)
         if match:
-            dp, tp, tpsp, fsdp = match.groups()
-            key = (int(dp), int(tp), int(tpsp), int(fsdp))
+            dp, tpsp, fsdp = match.groups()
+            key = (int(dp), int(tpsp), int(fsdp))
             configs.setdefault(key, []).append(log_file)
 
     # Plot for each config
-    for (dp, tp, tpsp, fsdp), files in configs.items():
+    for (dp, tpsp, fsdp), files in configs.items():
         plt.figure(figsize=(8, 5))
         for log_file in files:
             data = parse_loss_data(log_file)
@@ -62,10 +67,10 @@ def main(args):
         plt.legend()
         plt.xlabel('Step')
         plt.ylabel('Loss')
-        plt.title(f'Loss Curves (dp={dp}, tp={tp}, tpsp={tpsp}, fsdp={fsdp})')
+        plt.title(f'Loss Curves (dp={dp}, tpsp={tpsp}, fsdp={fsdp})')
         plt.grid(True)
         plt.tight_layout()
-        out_image_path = f"loss_curves_dp{dp}_tp{tp}_tpsp{tpsp}_fsdp{fsdp}.png"
+        out_image_path = f"loss_curves_dp{dp}_tpsp{tpsp}_fsdp{fsdp}.png"
         plt.savefig(out_image_path)
         print(f"Saved plot to {out_image_path}")
         plt.close()
