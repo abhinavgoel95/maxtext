@@ -39,6 +39,9 @@ You can also find other examples in the [MaxText repository](https://github.com/
 :maxdepth: 1
 
 tutorials/first_run.md
+tutorials/pretraining.md
 tutorials/full_finetuning.md
 tutorials/run_llama2.md
+tutorials/grpo.md
+tutorials/sft.md
 ```
