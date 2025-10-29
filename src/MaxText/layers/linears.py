@@ -354,7 +354,6 @@ class MlpBlock(nnx.Module):
       model_mode: None | str = None,
       *,
       rngs: nnx.Rngs,
-      use_te_comm_gemm_overlap: bool = False,
       collective_op_sets: Tuple = None,
   ) -> None:
     """A MlpBlock module.
@@ -423,7 +422,7 @@ class MlpBlock(nnx.Module):
           use_bias=self.use_bias,
           matmul_precision=self.config.matmul_precision,
           rngs=rngs,
-          use_te_comm_gemm_overlap=use_te_comm_gemm_overlap,
+          use_te_comm_gemm_overlap=self.config.use_te_comm_gemm_overlap,
           collective_op_set=None if not collective_op_sets else collective_op_sets[0],
       )
     else:
@@ -441,7 +440,7 @@ class MlpBlock(nnx.Module):
             use_bias=self.use_bias,
             matmul_precision=self.config.matmul_precision,
             rngs=rngs,
-            use_te_comm_gemm_overlap=use_te_comm_gemm_overlap if idx==0 else False,
+            use_te_comm_gemm_overlap=self.config.use_te_comm_gemm_overlap if idx==0 else False,
             collective_op_set=None if not collective_op_sets else collective_op_sets[0],
         )
         setattr(self, dense_name, module)
@@ -458,7 +457,7 @@ class MlpBlock(nnx.Module):
         use_bias=self.use_bias,
         matmul_precision=self.config.matmul_precision,
         rngs=rngs,
-        use_te_comm_gemm_overlap=use_te_comm_gemm_overlap,
+        use_te_comm_gemm_overlap=self.config.use_te_comm_gemm_overlap,
         collective_op_set=None if not collective_op_sets else collective_op_sets[1],
     )
 
