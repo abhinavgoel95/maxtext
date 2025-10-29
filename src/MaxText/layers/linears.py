@@ -86,7 +86,7 @@ def _compute_dot_general(inputs, kernel, kernel_axes, axis, contract_ind, matmul
   dot_general = lax.dot_general
   matmul_precision = lax.Precision(matmul_precision)
   if quant:
-    dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes)
+    dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes, collective_op_set=self.collective_op_set)
     dot_general = dot_general_cls()
     return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
   return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision)
@@ -233,16 +233,6 @@ class DenseGeneral(nnx.Module):
       kernel = jnp.asarray(kernel, self.dtype)
 
     contract_ind = tuple(range(0, len(self.axis)))
-
-    if self.use_te_comm_gemm_overlap:
-      output = te_dense(
-              inputs,
-              kernel,
-              bias=self.bias,
-              contracting_dims=((2,), (0,)),  # Contract over last input axis and first kernel axis
-              collective_op_set=self.collective_op_set,
-          )
-      return output
 
     output = _compute_dot_general_nnx(
         inputs,
