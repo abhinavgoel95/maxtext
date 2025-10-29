@@ -131,7 +131,6 @@ class LlamaDecoderLayer(nnx.Module):
         model_mode=model_mode,
         rngs=rngs,
         use_pre_norm=use_te,
-        use_te_comm_gemm_overlap=config.use_te_comm_gemm_overlap,
         collective_op_sets=collective_op_sets,
     )
 
