@@ -793,6 +793,11 @@ class RoutedMoE(nnx.Module):
     """Perform sparse matrix multiplication of inputs and Experts."""
 
     def gmm(inputs, kernel, tiling, group_sizes, expert_assignments):
+      if self.config.quantization.startswith("te_"):
+        assert not self.config.megablox, "Megablox not supported with TE quantization."
+        assert not self.config.use_tokamax_gmm, "Tokamax GMM not supported with TE quantization."
+        return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
+
       pad_length = self.config.wi_tile_fwd_batch_seq
       hs_shape = inputs.shape
       # pad length is the 1st dimension of tiling size in gmm call
@@ -1213,6 +1218,7 @@ class RoutedMoE(nnx.Module):
 
       # Make sure XLA does not optimize by combining above All-Gather to unshard
       # on FSDP axis and the subsequent unshard on fsdp_transpose axis
+      # Is this required? Will this optimization_barrier cause other perf issues?
       w0_kernel = jax.lax.optimization_barrier(w0_kernel)
       w1_kernel = jax.lax.optimization_barrier(w1_kernel)
       wo_kernel = jax.lax.optimization_barrier(wo_kernel)
