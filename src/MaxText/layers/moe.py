@@ -89,7 +89,7 @@ def _sort_activations_custom_fwd(inputs: jax.Array, sort_indices: jax.Array) -> 
 def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tuple[jax.Array, None]:
   """Backward pass of the custom vjp for `_sort_activations()`."""
   sort_indices = residuals
-  return _sort_activations_custom(grads, jnp.argsort(sort_indices)), None
+  return _sort_activations_custom(grads, jnp.argsort(sort_indices).astype(jnp.int32)), None
 
 
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
@@ -538,7 +538,7 @@ class RoutedMoE(nnx.Module):
     flatten_selected_experts = jnp.ravel(selected_experts)
     if roll_to_expert_id is not None:
       flatten_selected_experts = (flatten_selected_experts - roll_to_expert_id) % self.num_experts
-    sorted_selected_experts = jnp.argsort(flatten_selected_experts)
+    sorted_selected_experts = jnp.argsort(flatten_selected_experts).astype(jnp.int32)
     # sort inputs for number of selected experts
     replicated_inputs_2d = jnp.repeat(inputs_2d, self.num_experts_per_tok, axis=0)
     sorted_inputs = _sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(
@@ -573,7 +573,7 @@ class RoutedMoE(nnx.Module):
 
     unsort_intermediate = _sort_activations(
         intermediate,
-        jnp.argsort(sorted_selected_experts),
+        jnp.argsort(sorted_selected_experts).astype(jnp.int32),
         use_custom_sort_vjp,
     )
     reshaped_weights = jnp.reshape(weights, (-1, self.num_experts_per_tok))
@@ -674,7 +674,7 @@ class RoutedMoE(nnx.Module):
       base_indices = jnp.mod(jnp.arange(local_sizes.shape[0]), local_expert_size)
       expert_indices = jnp.repeat(base_indices, local_sizes, total_repeat_length=inputs.shape[0])
 
-    sorted_indices = jnp.argsort(expert_indices)
+    sorted_indices = jnp.argsort(expert_indices).astype(jnp.int32)
     sorted_inputs = _sort_activations(inputs, sorted_indices, use_custom_sort_vjp)
     sorted_experts_ids = expert_indices[sorted_indices]
     return (
@@ -1159,7 +1159,7 @@ class RoutedMoE(nnx.Module):
             # locally unpermute back to the original order
             local_output = _sort_activations(
                 intermediate_output,
-                jnp.argsort(local_sorted_indices),  # pylint: disable=undefined-variable
+                jnp.argsort(local_sorted_indices).astype(jnp.int32),  # pylint: disable=undefined-variable
                 self.config.use_custom_sort_vjp,
             )
             input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
