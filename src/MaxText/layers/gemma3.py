@@ -23,7 +23,6 @@ from flax import linen as nn
 from flax import nnx
 
 from MaxText.common_types import Config, AttentionType, MODEL_MODE_PREFILL
-from MaxText import max_utils
 from MaxText.layers import quantizations
 from MaxText.layers import nnx_wrappers
 from MaxText.layers import initializers
@@ -32,6 +31,7 @@ from MaxText.layers.linears import DenseGeneral, MlpBlock, Dropout
 from MaxText.layers.normalizations import RMSNorm
 from MaxText.layers.quantizations import AqtQuantization as Quant
 from MaxText.layers.initializers import variable_to_logically_partitioned
+from maxtext.utils import max_utils
 
 
 GEMMA3_ATTENTION_PATTERN = (
@@ -193,6 +193,9 @@ class Gemma3DecoderLayer(nnx.Module):
       attention_metadata=None,
   ):
     cfg = self.config
+    # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
+    if isinstance(inputs, tuple):
+      inputs = inputs[0]
     inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
 

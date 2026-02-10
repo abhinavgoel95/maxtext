@@ -19,6 +19,7 @@
 # See github.com/google/maxtext/issues/20 for more
 
 from typing import Any, Sequence
+import contextlib
 import datetime
 import functools
 import os
@@ -37,40 +38,38 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 
-from cloud_tpu_diagnostics import diagnostic
-from cloud_tpu_diagnostics.configuration import debug_configuration
-from cloud_tpu_diagnostics.configuration import diagnostic_configuration
-from cloud_tpu_diagnostics.configuration import stack_trace_configuration
-
-from MaxText import checkpointing
-from MaxText import exceptions
-from MaxText import max_logging
-from MaxText import max_utils
-from MaxText import maxtext_utils
-from MaxText import train_utils
-from MaxText import profiler
 from MaxText import pyconfig
 from MaxText import sharding
 from MaxText.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss
 from MaxText.common_types import ShardMode
 from MaxText.globals import EPS
-from MaxText.metric_logger import MetricLogger
-from MaxText.utils import gcs_utils
-from MaxText.utils.goodput_utils import (
+# Placeholder: internal
+
+from MaxText.gradient_accumulation import gradient_accumulation_loss_and_grad
+from MaxText.vocabulary_tiling import vocab_tiling_linen_loss
+# pylint: disable=too-many-positional-arguments
+
+from maxtext.common import checkpointing, profiler
+from maxtext.common.goodput import (
     GoodputEvent,
     create_goodput_recorder,
     maybe_monitor_goodput,
     maybe_record_goodput,
 )
-from MaxText.vertex_tensorboard import VertexTensorboardManager
-# Placeholder: internal
+from maxtext.common.gcloud_stub import cloud_diagnostics as _cloud_diag, is_decoupled
+from maxtext.common.gcloud_stub import vertex_tensorboard_modules
+from maxtext.common.metric_logger import MetricLogger, record_activation_metrics
+from maxtext.trainers.post_train.dpo.dpo_utils import _merge_dpo_state, _split_dpo_state, dpo_loss_fn
+from maxtext.utils import exceptions
+from maxtext.utils import gcs_utils
+from maxtext.utils import max_logging
+from maxtext.utils import max_utils
+from maxtext.utils import maxtext_utils
+from maxtext.utils import train_utils
 
-from MaxText.gradient_accumulation import gradient_accumulation_loss_and_grad
-from MaxText.vocabulary_tiling import vocab_tiling_linen_loss
-from MaxText.dpo_utils import _merge_dpo_state, _split_dpo_state, dpo_loss_fn
-from MaxText.train_utils import validate_train_config
-from MaxText.metric_logger import record_activation_metrics
-# pylint: disable=too-many-positional-arguments
+_diag_modules = _cloud_diag()
+diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = _diag_modules
+VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 
 
 def get_first_step(state):
@@ -146,6 +145,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
           ("activation_embed_and_logits_batch", "activation_length"),
           model.mesh,
           config.shard_mode,
+          debug_sharding=config.debug_sharding,
       )
       # Mask out paddings at the end of each example.
       xent = xent * (data["targets_segmentation"] != 0)
@@ -179,9 +179,13 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   # Zero1+GA to reduce communication overhead.
   # EPS was used to avoid division by zero, but it's not needed when gradient
   # accumulation is enabled since there's no division.
-  if config.gradient_accumulation_steps > 1:
+  if config.gradient_accumulation_steps > 1 and not config.use_tunix_gradient_accumulation:
     loss = total_loss
   else:
+    # When using Tunix gradient accumulation, we revert to standard normalization.
+    # Unlike the manual accumulation path above, Tunix (via optax.MultiSteps) expects
+    # a normalized loss for each step. It handles the accumulation state
+    # updates and scaling internally.
     loss = total_loss / (total_weights + EPS)
 
   # Calculate and Add MTP Loss
@@ -190,13 +194,19 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     mtp_loss = calculate_mtp_loss(intermediate_outputs, config)
     loss += mtp_loss
 
-  # get moe load balance loss
+  # get MoE load balance loss
   moe_lb_loss = 0.0
   if config.num_experts > 1:
     nested_key = ("intermediates", "decoder", "layers", "moe_lb_loss")
     total_moe_lb_loss = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
     moe_lb_loss = jnp.mean(jnp.array(total_moe_lb_loss))
     loss += moe_lb_loss
+
+  # get MoE routed bias term updates
+  moe_bias_updates = None
+  if config.routed_bias and config.routed_bias_update_rate > 0.0:
+    nested_key = ("intermediates", "decoder", "moe_layers", "moe_bias_updates")
+    moe_bias_updates = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None)
 
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
@@ -207,6 +217,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       "total_loss": total_loss,
       "total_weights": total_weights,
       "moe_lb_loss": moe_lb_loss,
+      "moe_bias_updates": moe_bias_updates,
       "mtp_loss": mtp_loss,
   }
   return loss, aux
@@ -261,7 +272,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         )
         extra_dpo_args = [reference_params]
     if config.shard_optimizer_over_data:
-      params = jax.tree.map(jax.lax.with_sharding_constraint, params, params_shardings)
+      params = jax.tree.map(
+          functools.partial(sharding.maybe_shard_with_name, shard_mode=config.shard_mode),
+          params,
+          params_shardings,
+      )
     grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
     (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, params, *extra_dpo_args, is_train=True)
 
@@ -272,6 +287,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   intermediate_outputs = aux["intermediate_outputs"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
+  moe_bias_updates = aux["moe_bias_updates"]
   mtp_loss = aux["mtp_loss"]
 
   if config.gradient_clipping_threshold > 0:
@@ -303,6 +319,14 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         )
     )
   new_state = state.apply_gradients(grads=grads)
+
+  # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
+  if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
+    target_path = ("params", "decoder", "moe_layers", "DeepSeekMoeBlock_0", "MoeBlock_0", "gate", "bias")
+    # Flax 'sow' returns a tuple, so we take the first element [0].
+    # Updates the shape to be aligned with state.
+    moe_bias_updates = jnp.array(moe_bias_updates[0]).transpose()
+    new_state = maxtext_utils.update_state_param(new_state, target_path, moe_bias_updates)
 
   scalar_metrics = {
       "learning/loss": loss,
@@ -402,10 +426,11 @@ def train_loop(config, recorder, state=None):
       params_shardings,
   )
 
-  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     shaped_batch = maxtext_utils.get_shaped_batch(config)
     if config.shard_optimizer_over_data:
       state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+    maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
     if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
       compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
       compiled_stats = compiled.memory_analysis()
@@ -425,16 +450,10 @@ def train_loop(config, recorder, state=None):
 
       with jax.profiler.StepTraceAnnotation("train", step_num=step):
         example_batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
-        # Reshard data from loaded sharding to performant activation sharding
-        example_batch = sharding.maybe_shard_with_name(
-            example_batch,
-            sharding.get_input_data_sharding(config, mesh),
-            shard_mode=config.shard_mode,
-        )
         # pylint: disable=not-callable
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
-          with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             if config.shard_optimizer_over_data:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
@@ -466,7 +485,7 @@ def train_loop(config, recorder, state=None):
         for eval_batch in eval_data_iterator:
           if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
             break
-          with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             eval_metrics = p_eval_step(state, eval_batch, nextrng)
           metric_logger.record_eval_metrics(step, metrics=eval_metrics)
           max_logging.log(f"Completed eval step {eval_step_count}")
@@ -513,7 +532,7 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]
   # or fill in here
   config = pyconfig.initialize(argv)
   max_utils.print_system_information()
-  validate_train_config(config)
+  train_utils.validate_train_config(config)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
   # update explicit sharding-supported config
   if config.shard_mode == ShardMode.EXPLICIT:
@@ -539,9 +558,22 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]
 
 
 def run(config, recorder, diagnostic_config):
-  """Run the job given hyperparameters and utilities"""
+  """Run the job given hyperparameters and utilities.
+
+  In decoupled mode (DECOUPLE_GCLOUD=TRUE) cloud diagnostics may be stubbed; if so, skip wrapping.
+  """
+  # Use nullcontext when diagnostics are stubbed or in decoupled mode
+  diagnostics_context = (
+      contextlib.nullcontext()
+      if is_decoupled() or getattr(diagnostic, "__class__", None).__name__ == "_StubDiag"
+      else diagnostic.diagnose(diagnostic_config)
+  )
+
+  if is_decoupled() or getattr(diagnostic, "__class__", None).__name__ == "_StubDiag":
+    max_logging.log("[DECOUPLED NO-OP] skipping cloud diagnostics wrapper.")
+
   with (
-      diagnostic.diagnose(diagnostic_config),
+      diagnostics_context,
       maybe_record_goodput(recorder, GoodputEvent.JOB),
       max_utils.maybe_get_transformer_engine_context(config),
       maybe_monitor_goodput(config),
