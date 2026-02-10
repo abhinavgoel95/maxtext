@@ -793,10 +793,7 @@ class RoutedMoE(nnx.Module):
     """Perform sparse matrix multiplication of inputs and Experts."""
 
     def gmm(inputs, kernel, tiling, group_sizes, expert_assignments):
-      if self.config.quantization.startswith("te_"):
-        assert not self.config.megablox, "Megablox not supported with TE quantization."
-        assert not self.config.use_tokamax_gmm, "Tokamax GMM not supported with TE quantization."
-        return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
+      use_te_gmm = self.config.quantization and self.config.quantization.startswith("te_")
 
       pad_length = self.config.wi_tile_fwd_batch_seq
       hs_shape = inputs.shape
@@ -812,11 +809,12 @@ class RoutedMoE(nnx.Module):
       kernel = kernel.astype(self.dtype)
 
       lhs_quantize_dtype, rhs_quantize_dtype = None, None
-      if self.quant is not None:
+      if self.quant is not None and not use_te_gmm:
         quant_dg = self.quant.quant_dg
         lhs_quantize_dtype = quant_dg.fwd.dg_quantizer.lhs.numerics.get_dtype()
         rhs_quantize_dtype = quant_dg.fwd.dg_quantizer.rhs.numerics.get_dtype()
       m, k, n = inputs.shape[0], inputs.shape[1], kernel.shape[2]
+      assert not use_te_gmm or (not self.config.megablox and not self.config.use_tokamax_gmm), "TE GMM is only supported when Megablox and Tokamax GMM are disabled."
       if not self.config.megablox and not self.config.use_tokamax_gmm:
         tiling = (
             min(tiling[0], m),
@@ -870,16 +868,19 @@ class RoutedMoE(nnx.Module):
             # Use full contraction for QWIX quantization to allow quantization
             # fusion (max reduce over contracting dimension).
             tiling = (tiling[0], k, tiling[2])
-          with set_xla_metadata(
-              ragged_dot_tiling=",".join([str(t) for t in tiling]),
-              mosaic_fusion_group=f"{random.randint(0, 1000000000)}",
-          ):
-            output = jax.lax.ragged_dot(
-                lhs=inputs,
-                rhs=rhs_inputs,
-                group_sizes=group_sizes,
-                preferred_element_type=self.dtype,
-            )
+          if use_te_gmm and False:
+            return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
+          else:
+            with set_xla_metadata(
+                ragged_dot_tiling=",".join([str(t) for t in tiling]),
+                mosaic_fusion_group=f"{random.randint(0, 1000000000)}",
+            ):
+              output = jax.lax.ragged_dot(
+                  lhs=inputs,
+                  rhs=rhs_inputs,
+                  group_sizes=group_sizes,
+                  preferred_element_type=self.dtype,
+              )
           if isinstance(kernel, aqt.QTensor):
             # Multiply outputs by the kernely scale
             scales = jnp.take(kernel.scale[0].squeeze(), indices=expert_assignments, axis=0)
