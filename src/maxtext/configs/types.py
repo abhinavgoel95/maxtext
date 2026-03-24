@@ -602,6 +602,24 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use Ring of Experts for sparse matmul expert parallelism.",
   )
+  ring_paged_stash: bool = Field(
+      False,
+      description=(
+          "Enable paged stashing for ring-of-experts MoE layers. "
+          "Instead of checkpointing GMM activations at worst-case buffer size "
+          "(batch*EP*seq*top_k), compactly stores only the actual routed tokens "
+          "in a shared static buffer, reducing host-offload memory ~4x for EP=4. "
+          "See layers/paged_stash.py for details."
+      ),
+  )
+  ring_paged_stash_safety_margin: float = Field(
+      1.5,
+      description=(
+          "Safety margin multiplier on the expected-per-layer token count used to "
+          "size each layer's stash chunk (max_chunk = expected * margin). "
+          "1.0 = no slack; 1.5 = tolerate 50%% per-layer imbalance without dropping."
+      ),
+  )
   te_permutation_impl: bool = Field(
       False,
       description="Whether to use TransformerEngine permutation kernels for MoE token dispatch/combine.",
@@ -2135,9 +2153,15 @@ class MaxTextConfig(
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",
+          "moe_mlpwi",
+          "moe_mlpwi_0",
+          "moe_mlpwi_1",
+          "moe_mlpwo",
           "query_proj",
           "key_proj",
           "value_proj",
+          "query_wa_proj",
+          "kv_wa_proj",
           "mla_kv",
           "mla_q",
           "qkv_proj",
