@@ -1811,6 +1811,7 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         intermediate_output = intermediate_output + wo_bias
       if self.config.use_ring_of_experts and self.config.ring_paged_stash:
+        print("PAGED STASH ACTIVE")
         # -------------------------------------------------------------------
         # Paged stashing: instead of checkpointing intermediate_output at
         # worst-case size (batch*EP*seq*top_k, hidden), store only the actual
