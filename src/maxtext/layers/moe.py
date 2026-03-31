@@ -25,7 +25,7 @@ from aqt.jax.v2 import aqt_tensor as aqt
 from flax import nnx
 import jax
 from jax import ad_checkpoint as adc
-from MaxText.layers import paged_stash as ps
+from maxtext.layers import paged_stash as ps
 from jax.experimental import xla_metadata
 from jax.sharding import NamedSharding, Mesh
 from jax.sharding import PartitionSpec as P
