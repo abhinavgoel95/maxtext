@@ -1814,13 +1814,17 @@ class RoutedMoE(nnx.Module):
         stash_fn, restore_fn = ps.make_stash_fns(max_chunk, self.config.emb_dim)
 
         # Stash: compact intermediate_output into the shared buffer.
-        # stash_buf / write_ptr come from the scan carry (see TODO above).
-        stash_buf, write_ptr = stash_fn(
-            stash_buf, write_ptr, intermediate_output, actual_tokens
+        # stash_buf / write_ptr come from the scan carry.
+        # Inside shard_map with P("expert"), write_ptr has shape (1,) not ();
+        # dynamic_update_slice requires a scalar, so extract and reshape.
+        _wp_scalar = write_ptr[0] if write_ptr.ndim > 0 else write_ptr
+        stash_buf, _new_wp = stash_fn(
+            stash_buf, _wp_scalar, intermediate_output, actual_tokens
         )
+        write_ptr = jnp.reshape(_new_wp, write_ptr.shape)
         # intermediate_output is no longer needed; the backward will restore it.
         intermediate_output = restore_fn(
-            stash_buf, write_ptr - actual_tokens, actual_tokens,
+            stash_buf, _wp_scalar, actual_tokens,
             intermediate_output.shape[0],
         )
       else:
