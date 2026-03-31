@@ -1811,8 +1811,11 @@ class RoutedMoE(nnx.Module):
             self.config.num_experts_per_tok,
         )
         max_chunk = int(expected * self.config.ring_paged_stash_safety_margin)
-        full_size = intermediate_output.shape[0]  # concrete Python int
-        stash_fn, restore_fn = ps.make_stash_fns(max_chunk, self.config.emb_dim, full_size)
+        full_size = intermediate_output.shape[0]          # concrete Python int
+        buf_total_capacity = stash_buf.shape[0]            # concrete Python int (local per-shard)
+        stash_fn, restore_fn = ps.make_stash_fns(
+            max_chunk, self.config.emb_dim, full_size, buf_total_capacity
+        )
 
         # Stash: compact intermediate_output into the shared buffer.
         # stash_buf / write_ptr come from the scan carry.

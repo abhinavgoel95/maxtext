@@ -101,16 +101,22 @@ from jax import lax
 # Core stash / restore primitives
 # ---------------------------------------------------------------------------
 
-def make_stash_fns(max_chunk: int, hidden: int, full_size: int):
+def make_stash_fns(max_chunk: int, hidden: int, full_size: int, buf_total_capacity: int):
   """Return (stash_fn, restore_fn) for a given static chunk size and hidden dim.
 
   Args:
-    max_chunk:  Static maximum number of tokens written per layer.  Must be >=
-                the maximum actual token count that will ever be encountered.
-                Set to  expected_per_layer * safety_margin  (e.g. 1.5x).
-    hidden:     Hidden dimension of the tensors to stash.
-    full_size:  Static worst-case token count (batch*EP*seq*top_k per shard).
-                Must be a concrete Python int (not a traced JAX value).
+    max_chunk:          Static maximum number of tokens written per layer.  Must
+                        be >= the maximum actual token count that will ever be
+                        encountered.  Set to expected_per_layer * safety_margin.
+    hidden:             Hidden dimension of the tensors to stash.
+    full_size:          Static worst-case token count per shard
+                        (batch*EP*seq*top_k).  Captured as a closure constant so
+                        jnp.arange stays concrete inside custom_vjp tracing.
+    buf_total_capacity: Total rows in the stash buffer (local per-EP-shard).
+                        Captured as a closure constant so restore_fn_bwd can
+                        allocate d_buf without saving `buf` as a residual
+                        (avoids storing the entire stash buffer per layer in
+                        backward memory).
 
   Returns:
     stash_fn:   (buf, write_ptr, x, actual_tokens) -> (new_buf, new_write_ptr)
@@ -159,8 +165,9 @@ def make_stash_fns(max_chunk: int, hidden: int, full_size: int):
 
   stash_fn.defvjp(stash_fn_fwd, stash_fn_bwd)
 
-  # full_size is a closure constant (concrete Python int), not a traced arg.
+  # full_size and buf_total_capacity are closure constants (concrete Python ints).
   _full_size = full_size
+  _buf_total_capacity = buf_total_capacity
 
   @jax.custom_vjp
   def restore_fn(buf, read_ptr, actual_tokens):
@@ -182,18 +189,23 @@ def make_stash_fns(max_chunk: int, hidden: int, full_size: int):
 
   def restore_fn_fwd(buf, read_ptr, actual_tokens):
     x_full = restore_fn(buf, read_ptr, actual_tokens)
-    return x_full, (buf, read_ptr, actual_tokens)
+    # Only save scalars as residuals — NOT buf itself.  buf has shape
+    # (buf_total_capacity, hidden) and saving it per layer would keep one full
+    # copy of the stash buffer alive in backward memory for every MoE layer,
+    # undoing all the memory savings.  d_buf is reconstructed from the closure
+    # constant _buf_total_capacity instead.
+    return x_full, (read_ptr, actual_tokens)
 
   def restore_fn_bwd(res, g_x_full):
-    buf, read_ptr, actual_tokens = res
+    read_ptr, actual_tokens = res
     # Gradient flows back into the compact slice: gather from g_x_full.
     indices = jnp.arange(max_chunk)
     mask = indices < actual_tokens
     d_compact = jnp.where(mask[:, None], g_x_full[:max_chunk], 0.0)
-    # Write d_compact back into a zeros buffer at read_ptr so the scan can
-    # accumulate into the shared d_buf.
+    # Write d_compact into a zeros buffer of the stash buf shape at read_ptr.
+    # _buf_total_capacity is a closure constant so no large tensor is saved.
     d_buf = lax.dynamic_update_slice(
-        jnp.zeros_like(buf),
+        jnp.zeros((_buf_total_capacity, hidden), dtype=g_x_full.dtype),
         d_compact, (read_ptr, 0)
     )
     return d_buf, 0, 0  # d_buf, d_read_ptr, d_actual_tokens
