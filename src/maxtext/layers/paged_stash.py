@@ -101,7 +101,7 @@ from jax import lax
 # Core stash / restore primitives
 # ---------------------------------------------------------------------------
 
-def make_stash_fns(max_chunk: int, hidden: int):
+def make_stash_fns(max_chunk: int, hidden: int, full_size: int):
   """Return (stash_fn, restore_fn) for a given static chunk size and hidden dim.
 
   Args:
@@ -109,10 +109,12 @@ def make_stash_fns(max_chunk: int, hidden: int):
                 the maximum actual token count that will ever be encountered.
                 Set to  expected_per_layer * safety_margin  (e.g. 1.5x).
     hidden:     Hidden dimension of the tensors to stash.
+    full_size:  Static worst-case token count (batch*EP*seq*top_k per shard).
+                Must be a concrete Python int (not a traced JAX value).
 
   Returns:
     stash_fn:   (buf, write_ptr, x, actual_tokens) -> (new_buf, new_write_ptr)
-    restore_fn: (buf, read_ptr, actual_tokens, full_size) -> (x_full,)
+    restore_fn: (buf, read_ptr, actual_tokens) -> (x_full,)
   """
 
   @jax.custom_vjp
@@ -156,42 +158,44 @@ def make_stash_fns(max_chunk: int, hidden: int):
 
   stash_fn.defvjp(stash_fn_fwd, stash_fn_bwd)
 
+  # full_size is a closure constant (concrete Python int), not a traced arg.
+  _full_size = full_size
+
   @jax.custom_vjp
-  def restore_fn(buf, read_ptr, actual_tokens, full_size):
+  def restore_fn(buf, read_ptr, actual_tokens):
     """Read actual_tokens rows from buf[read_ptr:] and scatter into (full_size, hidden).
 
     The caller's sorted token buffer has shape (full_size, hidden).  Only the
     first actual_tokens positions are non-zero (the rest were masked in the
     forward permute step).  restore_fn reconstructs this layout.
+    full_size is captured as a closure constant so jnp.arange stays concrete.
     """
     compact = lax.dynamic_slice(buf, (read_ptr, 0), (max_chunk, hidden))
     # Scatter compact tokens into positions [0:actual_tokens], zero elsewhere.
-    indices = jnp.arange(full_size)
+    indices = jnp.arange(_full_size)
     mask = indices < actual_tokens
     # Clamp indices to avoid out-of-bounds; masked positions get overwritten anyway.
     safe_idx = jnp.minimum(indices, max_chunk - 1)
     x_full = jnp.where(mask[:, None], compact[safe_idx], 0.0)
     return x_full
 
-  def restore_fn_fwd(buf, read_ptr, actual_tokens, full_size):
-    x_full = restore_fn(buf, read_ptr, actual_tokens, full_size)
-    return x_full, (read_ptr, actual_tokens)
+  def restore_fn_fwd(buf, read_ptr, actual_tokens):
+    x_full = restore_fn(buf, read_ptr, actual_tokens)
+    return x_full, (buf, read_ptr, actual_tokens)
 
   def restore_fn_bwd(res, g_x_full):
-    read_ptr, actual_tokens = res
+    buf, read_ptr, actual_tokens = res
     # Gradient flows back into the compact slice: gather from g_x_full.
     indices = jnp.arange(max_chunk)
     mask = indices < actual_tokens
     d_compact = jnp.where(mask[:, None], g_x_full[:max_chunk], 0.0)
-    # Write d_compact into an all-zero d_buf at read_ptr.
-    d_buf = jnp.zeros((lax.dynamic_slice.out_aval,), dtype=g_x_full.dtype)  # placeholder
-    # NOTE: caller must accumulate into the shared d_buf.
-    # Return as a zeros buffer with the slice filled; the scan will accumulate.
+    # Write d_compact back into a zeros buffer at read_ptr so the scan can
+    # accumulate into the shared d_buf.
     d_buf = lax.dynamic_update_slice(
-        jnp.zeros_like(g_x_full[:1].repeat(max_chunk, axis=0)),  # shape hint
-        d_compact, (0, 0)
+        jnp.zeros_like(buf),
+        d_compact, (read_ptr, 0)
     )
-    return d_buf, 0, 0, 0
+    return d_buf, 0, 0  # d_buf, d_read_ptr, d_actual_tokens
 
   restore_fn.defvjp(restore_fn_fwd, restore_fn_bwd)
 

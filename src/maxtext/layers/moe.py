@@ -1811,7 +1811,8 @@ class RoutedMoE(nnx.Module):
             self.config.num_experts_per_tok,
         )
         max_chunk = int(expected * self.config.ring_paged_stash_safety_margin)
-        stash_fn, restore_fn = ps.make_stash_fns(max_chunk, self.config.emb_dim)
+        full_size = intermediate_output.shape[0]  # concrete Python int
+        stash_fn, restore_fn = ps.make_stash_fns(max_chunk, self.config.emb_dim, full_size)
 
         # Stash: compact intermediate_output into the shared buffer.
         # stash_buf / write_ptr come from the scan carry.
@@ -1823,10 +1824,8 @@ class RoutedMoE(nnx.Module):
         )
         write_ptr = jnp.reshape(_new_wp, write_ptr.shape)
         # intermediate_output is no longer needed; the backward will restore it.
-        intermediate_output = restore_fn(
-            stash_buf, _wp_scalar, actual_tokens,
-            intermediate_output.shape[0],
-        )
+        # full_size is captured as a closure constant in restore_fn.
+        intermediate_output = restore_fn(stash_buf, _wp_scalar, actual_tokens)
       else:
         intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
