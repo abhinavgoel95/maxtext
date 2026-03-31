@@ -1373,6 +1373,8 @@ class RoutedMoE(nnx.Module):
       w0_bias,
       w1_bias,
       wo_bias,
+      stash_buf=None,
+      write_ptr=None,
   ):
     """Perform sparse matrix multiplication of inputs and Experts."""
 
@@ -1568,29 +1570,7 @@ class RoutedMoE(nnx.Module):
     if isinstance(wo_kernel, aqt.QTensor):
       wo_pspec = aqt.partition_spec(wo_pspec, (1,), wo_kernel.dtype, use_bias=False)
 
-    @functools.partial(
-        jax.shard_map,
-        mesh=self.mesh,
-        in_specs=(
-            input_partition_pspec,
-            gate_logits_pspec,
-            pre_bias_logits_pspec,
-            w0_pspec,
-            w1_pspec,
-            wo_pspec,
-            w0_bias_pspec,
-            w1_bias_pspec,
-            wo_bias_pspec,
-            P(),  # Replicate the input key
-        ),
-        out_specs=(
-            self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
-            P(),  # Handle None or replicate the output
-            P(),  # Handle None or replicate the output
-        ),
-        check_vma=False,
-    )
-    def wrapper(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, rngs):
+    def _body(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, rngs, stash_buf=None, write_ptr=None):
       batch_size, sequence_length, _ = x.shape
       num_expert_parallelism = self.get_expert_parallelism_size()
       if num_expert_parallelism > 1:
@@ -1936,7 +1916,44 @@ class RoutedMoE(nnx.Module):
             intermediate_output, perm_state, group_sizes, batch_size, sequence_length,
         )
 
-      return output, lb_loss, bias_updates
+      return output, lb_loss, bias_updates, stash_buf, write_ptr
+
+    _use_paged_stash = self.config.use_ring_of_experts and self.config.ring_paged_stash
+    _expert_axis = self._expert_parallelism_name
+
+    _base_in_specs = (
+        input_partition_pspec,
+        gate_logits_pspec,
+        pre_bias_logits_pspec,
+        w0_pspec,
+        w1_pspec,
+        wo_pspec,
+        w0_bias_pspec,
+        w1_bias_pspec,
+        wo_bias_pspec,
+        P(),  # Replicate the input key
+    )
+    _base_out_specs = (
+        self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", "activation_embed")),
+        P(),  # Handle None or replicate the output
+        P(),  # Handle None or replicate the output
+    )
+
+    if _use_paged_stash:
+      _wrapper = jax.shard_map(
+          _body, mesh=self.mesh,
+          in_specs=_base_in_specs + (P(_expert_axis), P(_expert_axis)),
+          out_specs=_base_out_specs + (P(_expert_axis), P(_expert_axis)),
+          check_vma=False,
+      )
+    else:
+      def _body_no_stash(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, rngs):
+        out, lb, bu, _, _ = _body(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, rngs, None, None)
+        return out, lb, bu
+      _wrapper = jax.shard_map(
+          _body_no_stash, mesh=self.mesh,
+          in_specs=_base_in_specs, out_specs=_base_out_specs, check_vma=False,
+      )
 
     if self.config.moe_fsdp_use_two_stage_all_gather:
       # Unshard on fsdp axis
@@ -1972,9 +1989,15 @@ class RoutedMoE(nnx.Module):
     gate_logits = self._maybe_shard_with_logical(gate_logits, gate_logits_axes)
     pre_bias_logits = self._maybe_shard_with_logical(pre_bias_logits, pre_bias_logits_axes)
 
-    return wrapper(
-        inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, self.rngs
-    )
+    if _use_paged_stash:
+      return _wrapper(
+          inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, self.rngs,
+          stash_buf, write_ptr,
+      )
+    else:
+      return _wrapper(
+          inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, self.rngs
+      )
 
   def reshape_and_update_weights(self, weights, indices):
     """reshape and update weights."""
@@ -2547,8 +2570,9 @@ class RoutedMoE(nnx.Module):
     return w0_kernel, w1_kernel, wo_kernel
 
   def __call__(
-      self, inputs: jax.Array, out_sharding: NamedSharding | None = None
-  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
+      self, inputs: jax.Array, out_sharding: NamedSharding | None = None,
+      stash_buf=None, write_ptr=None,
+  ) -> tuple:
     cfg = self.config
     inputs = inputs.astype(cfg.dtype)
     gate_logits, pre_bias_logits = self.gate(inputs)
@@ -2577,14 +2601,20 @@ class RoutedMoE(nnx.Module):
             w1_bias,
             wo_bias,
         )
-      output, lb_loss, bias_updates = self.sparse_matmul(
-          inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias
-      )
+      if self.config.ring_paged_stash:
+        output, lb_loss, bias_updates, stash_buf, write_ptr = self.sparse_matmul(
+            inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias,
+            stash_buf=stash_buf, write_ptr=write_ptr,
+        )
+      else:
+        output, lb_loss, bias_updates = self.sparse_matmul(
+            inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias
+        )
     else:
       output, lb_loss, bias_updates = self.dense_matmul(
           inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias
       )
-    return output, lb_loss, bias_updates
+    return output, lb_loss, bias_updates, stash_buf, write_ptr
 
 
 class RoutedAndSharedMoE(nnx.Module):
@@ -2658,10 +2688,14 @@ class RoutedAndSharedMoE(nnx.Module):
       inputs: jax.Array,
       intermediate_sharding: NamedSharding | None = None,
       out_sharding: NamedSharding | None = None,
-  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
-    routed_experts, load_balance_loss, moe_bias_updates = self.routed_moe(inputs, out_sharding=out_sharding)
+      stash_buf=None,
+      write_ptr=None,
+  ) -> tuple:
+    routed_experts, load_balance_loss, moe_bias_updates, stash_buf, write_ptr = self.routed_moe(
+        inputs, out_sharding=out_sharding, stash_buf=stash_buf, write_ptr=write_ptr
+    )
     shared_experts = self.shared_experts(inputs, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding)
-    return routed_experts + shared_experts, load_balance_loss, moe_bias_updates
+    return routed_experts + shared_experts, load_balance_loss, moe_bias_updates, stash_buf, write_ptr
 
 
 def get_gate_logit(

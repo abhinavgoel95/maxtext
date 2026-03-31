@@ -238,7 +238,8 @@ class DeepSeekGenericLayer(nnx.Module):
     axis_names = ["activation_batch", length_name, "activation_mlp"]
     return axis_names
 
-  def post_process(self, layer_output, load_balance_loss, moe_bias_updates, kv_cache=None):
+  def post_process(self, layer_output, load_balance_loss, moe_bias_updates, kv_cache=None,
+                   stash_buf=None, write_ptr=None):
     """postprocessing."""
 
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
@@ -257,6 +258,8 @@ class DeepSeekGenericLayer(nnx.Module):
       )
 
     if self.config.scan_layers:
+      if stash_buf is not None:
+        return (layer_output, stash_buf, write_ptr), None
       return layer_output, None
     return layer_output, kv_cache
 
@@ -437,9 +440,14 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       attention_metadata=None,
       decoder_input_tokens=None,
   ):
-    # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
+    # Unpack inputs from scan carry
+    stash_buf, write_ptr = None, None
     if isinstance(inputs, tuple):
-      inputs = inputs[0]
+      if self.config.ring_paged_stash and len(inputs) == 3:
+        # paged stash carry: (hidden, stash_buf, write_ptr)
+        inputs, stash_buf, write_ptr = inputs
+      else:
+        inputs = inputs[0]
 
     # This code should only be traced during initialization when using
     # batch-split schedule. It is never run during model execution, since
@@ -512,17 +520,21 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
       load_balance_loss = metadata["load_balance_loss"]
       moe_bias_updates = metadata["moe_bias_updates"]
     else:
-      mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(hidden_states, deterministic)
+      mlp_lnx, load_balance_loss, moe_bias_updates, stash_buf, write_ptr = self.mlp_op(
+          hidden_states, deterministic, stash_buf=stash_buf, write_ptr=write_ptr
+      )
       layer_output = mlp_lnx + intermediate_inputs
     layer_output = self.dropout_op(layer_output, deterministic=deterministic)
 
-    return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
+    return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache,
+                             stash_buf=stash_buf, write_ptr=write_ptr)
 
-  def mlp_op(self, x, deterministic, *args, **kwargs):
-    mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
-        x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding
+  def mlp_op(self, x, deterministic, stash_buf=None, write_ptr=None, *args, **kwargs):
+    mlp_lnx, load_balance_loss, moe_bias_updates, stash_buf, write_ptr = self.DeepSeekMoeBlock_0(
+        x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding,
+        stash_buf=stash_buf, write_ptr=write_ptr,
     )
-    return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
+    return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates, stash_buf, write_ptr
 
 
 DeepSeekMoELayerToLinen = nnx_wrappers.to_linen_class(

@@ -33,6 +33,7 @@ from maxtext.inference import page_manager
 from maxtext.layers import linears
 from maxtext.layers import mhc
 from maxtext.layers import normalizations
+from maxtext.layers import paged_stash as ps
 from maxtext.layers import pipeline
 from maxtext.layers import quantizations
 from maxtext.layers.attentions import attention_as_linen
@@ -924,15 +925,47 @@ class Decoder(nn.Module):
                   policy=policy,
               )
             else:
-              y, _ = self.scan_decoder_layers(
-                  cfg,
-                  moe_layer,
-                  num_moe_layers,
-                  "moe_layers",
-                  mesh,
-                  in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
-                  model_mode=model_mode,
-              )(y, *broadcast_args)
+              if cfg.ring_paged_stash:
+                _batch_size = y.shape[0]
+                _seq_len = y.shape[1]
+                _expected = ps.expected_tokens_per_layer(
+                    _batch_size, 1, _seq_len, cfg.num_experts_per_tok
+                )
+                _max_chunk = int(_expected * cfg.ring_paged_stash_safety_margin)
+                _num_moe_layers = num_moe_layers
+                _total_capacity = ps.stash_buffer_size(_num_moe_layers, _expected, _max_chunk)
+                _expert_axis = "expert"
+                _EP = self.mesh.shape.get(_expert_axis, 1)
+                _stash_buf = jnp.zeros((_EP * _total_capacity, cfg.emb_dim), dtype=cfg.dtype)
+                _write_ptr = jnp.zeros((_EP,), dtype=jnp.int32)
+                if _EP > 1:
+                  _stash_buf = jax.lax.with_sharding_constraint(
+                      _stash_buf, jax.sharding.PartitionSpec(_expert_axis)
+                  )
+                  _write_ptr = jax.lax.with_sharding_constraint(
+                      _write_ptr, jax.sharding.PartitionSpec(_expert_axis)
+                  )
+                _carry = (y, _stash_buf, _write_ptr)
+                (_carry_out, _, _), _ = self.scan_decoder_layers(
+                    cfg,
+                    moe_layer,
+                    num_moe_layers,
+                    "moe_layers",
+                    mesh,
+                    in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
+                    model_mode=model_mode,
+                )(_carry, *broadcast_args)
+                y = _carry_out
+              else:
+                y, _ = self.scan_decoder_layers(
+                    cfg,
+                    moe_layer,
+                    num_moe_layers,
+                    "moe_layers",
+                    mesh,
+                    in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
+                    model_mode=model_mode,
+                )(y, *broadcast_args)
         elif cfg.decoder_block == DecoderBlockType.GEMMA3:
           y = self._apply_gemma3_scanned_blocks(
               y,
