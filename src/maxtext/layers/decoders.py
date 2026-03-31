@@ -939,12 +939,14 @@ class Decoder(nn.Module):
                 _stash_buf = jnp.zeros((_EP * _total_capacity, cfg.emb_dim), dtype=cfg.dtype)
                 _write_ptr = jnp.zeros((_EP,), dtype=jnp.int32)
                 if _EP > 1:
-                  _stash_buf = jax.lax.with_sharding_constraint(
-                      _stash_buf, jax.sharding.PartitionSpec(_expert_axis)
+                  _buf_sharding = jax.sharding.NamedSharding(
+                      self.mesh, jax.sharding.PartitionSpec(_expert_axis)
                   )
-                  _write_ptr = jax.lax.with_sharding_constraint(
-                      _write_ptr, jax.sharding.PartitionSpec(_expert_axis)
+                  _ptr_sharding = jax.sharding.NamedSharding(
+                      self.mesh, jax.sharding.PartitionSpec(_expert_axis)
                   )
+                  _stash_buf = jax.lax.with_sharding_constraint(_stash_buf, _buf_sharding)
+                  _write_ptr = jax.lax.with_sharding_constraint(_write_ptr, _ptr_sharding)
                 _carry = (y, _stash_buf, _write_ptr)
                 (_carry_out, _, _), _ = self.scan_decoder_layers(
                     cfg,
