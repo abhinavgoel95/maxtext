@@ -146,9 +146,10 @@ def make_stash_fns(max_chunk: int, hidden: int, full_size: int):
     mask = jnp.arange(max_chunk) < actual_tokens
     d_x_chunk = jnp.where(mask[:, None], d_chunk, 0.0)
     # Pad d_x back to the full worst_case size expected by the caller.
-    # The caller's x has shape (full_size, hidden); we only touched [:max_chunk].
+    # The caller's x has shape (_full_size, hidden); we only touched [:max_chunk].
     # Positions [max_chunk:] had zero gradient contribution.
-    d_x = jnp.zeros_like(d_chunk)  # will be broadcast by caller if needed
+    # Must use _full_size (closure constant) not max_chunk to match primal x shape.
+    d_x = jnp.zeros((_full_size, hidden), dtype=d_chunk.dtype)
     d_x = d_x.at[:max_chunk].set(d_x_chunk)
     # Gradient w.r.t. buf: the updated slice is consumed, so pass d_new_buf
     # back with the written region zeroed out (it has been "consumed").
