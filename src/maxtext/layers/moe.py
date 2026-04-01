@@ -1629,7 +1629,60 @@ class RoutedMoE(nnx.Module):
         expert_shard_id = 0
       num_expert_parallelism = self.get_expert_parallelism_size()
 
-      if self.config.use_ring_of_experts:
+      if self.config.use_hybrid_ep:
+        # =======================================================================
+        # HybridEP path: DeepEP handles dispatch + all-to-all + local permute
+        # in one fused call. Bypasses permute/allgather/ragged_all_to_all.
+        # =======================================================================
+        from jax_deep_ep.ffi_ops import hybrid_ep_dispatch_ffi, hybrid_ep_combine_ffi
+        from MaxText.layers import te_permutation
+
+        N = batch_size * sequence_length
+        E = self.config.num_experts
+        E_local = E // num_expert_parallelism
+        pad = self.config.hybrid_ep_pad_multiple
+
+        # Step 1: Routing decisions (same logic as permute, without sorting)
+        weights, top_k_indices = self.get_topk(logits, pre_bias_logits, rngs)
+
+        lb_loss = None
+        if self.config.load_balance_loss_weight > 0.0:
+          softmax_probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+          lb_loss = self.load_balance_loss(top_k_indices, softmax_probs)
+
+        bias_updates = None
+        if self.should_update_load_balance():
+          bias_updates = calculate_load_balance_updates(
+              top_k_indices, E, self.config.routed_bias_update_rate)
+
+        # Step 2: Build routing map + probs using te_permutation helpers
+        routing_map = te_permutation.create_routing_map_from_indices(top_k_indices, E)
+        dense_probs = te_permutation.create_dense_probs_from_topk(weights, top_k_indices, E)
+
+        # LLAMA4: pre-multiply inputs by sigmoid weights
+        x_2d = x.reshape(N, -1)
+        if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
+          router_scores = jax.nn.sigmoid(weights.astype(jnp.float32))
+          x_2d = x_2d * router_scores.reshape(N, -1)
+
+        # Step 3: HybridEP dispatch (replaces allgather + ragged_all_to_all + local_permute)
+        dispatched, tokens_per_expert, dispatched_probs = hybrid_ep_dispatch_ffi(
+            x_2d, routing_map.astype(jnp.bool_), probs=dense_probs.astype(jnp.float32),
+            pad_multiple=pad,
+        )
+
+        # Step 4: Expert compute — reuse existing gmm with tokens_per_expert as group_sizes
+        # TE GMM handles the padded-per-expert layout natively.
+        group_sizes = tokens_per_expert
+        expert_indices = jnp.arange(E_local)
+        selected_experts = jnp.repeat(
+            expert_indices, repeats=group_sizes, total_repeat_length=dispatched.shape[0],
+        )
+        x = dispatched
+
+        # (Falls through to the shared GMM section below)
+
+      elif self.config.use_ring_of_experts:
         # The ring-of-experts strategy first duplicates the inputs to all
         # expert shards, and then routes within each shard.
 
@@ -1820,7 +1873,25 @@ class RoutedMoE(nnx.Module):
         intermediate_output = intermediate_output + wo_bias
       intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
 
-      if self.config.use_ring_of_experts:
+      if self.config.use_hybrid_ep:
+        # =======================================================================
+        # HybridEP combine: pre-weight expert outputs, then DeepEP combine
+        # =======================================================================
+        # Pre-weight: apply routing weights before combine so the sum is weighted correctly.
+        # dispatched_probs[i] is the routing weight for the i-th permuted token.
+        # For LLAMA4, weights are already applied via sigmoid pre-multiplication.
+        if self.config.decoder_block != ctypes.DecoderBlockType.LLAMA4:
+          intermediate_output = (
+              intermediate_output * dispatched_probs[:intermediate_output.shape[0], None]
+          ).astype(jnp.bfloat16)
+
+        # HybridEP combine (replaces local_unpermute + ragged_all_to_all + unpermute)
+        if intermediate_output.dtype != jnp.bfloat16:
+          intermediate_output = intermediate_output.astype(jnp.bfloat16)
+        output = hybrid_ep_combine_ffi(intermediate_output, pad_multiple=pad)
+        output = output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
+
+      elif self.config.use_ring_of_experts:
         # For the MT path, zero out non-local expert positions before unpermute
         # because MT's inverse permutation reads all positions (including garbage
         # from ragged_dot's unused rows). The TE path doesn't need this — its
