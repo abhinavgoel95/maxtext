@@ -1635,7 +1635,6 @@ class RoutedMoE(nnx.Module):
         # in one fused call. Bypasses permute/allgather/ragged_all_to_all.
         # =======================================================================
         from jax_deep_ep.ffi_ops import hybrid_ep_dispatch_ffi, hybrid_ep_combine_ffi
-        from MaxText.layers import te_permutation
 
         N = batch_size * sequence_length
         E = self.config.num_experts

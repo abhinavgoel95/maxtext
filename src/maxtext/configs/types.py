@@ -683,6 +683,10 @@ class MoEGeneral(BaseModel):
       32,
       description="Padding alignment for hybridEP expert GEMMs. DeepEP pads each expert's tokens to this multiple.",
   )
+  forward_pass_only: bool = Field(
+      False,
+      description="Skip gradient computation in train_step. Forward pass only with dummy zero gradients.",
+  )
   te_router_and_permutation_impl: bool = Field(
       False,
       description="Whether to use TransformerEngine fused router and permutation kernels for MoE routing and token dispatch/combine.",
