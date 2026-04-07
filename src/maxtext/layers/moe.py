@@ -1634,7 +1634,8 @@ class RoutedMoE(nnx.Module):
         # HybridEP path: DeepEP handles dispatch + all-to-all + local permute
         # in one fused call. Bypasses permute/allgather/ragged_all_to_all.
         # =======================================================================
-        from jax_deep_ep.ffi_ops import hybrid_ep_dispatch_ffi, hybrid_ep_combine_ffi
+        from jax_deep_ep.autodiff import dispatch_differentiable, combine_differentiable
+        import jax_deep_ep.autodiff as _hybridep_autodiff
 
         N = batch_size * sequence_length
         E = self.config.num_experts
@@ -1664,11 +1665,17 @@ class RoutedMoE(nnx.Module):
           router_scores = jax.nn.sigmoid(weights.astype(jnp.float32))
           x_2d = x_2d * router_scores.reshape(N, -1)
 
-        # Step 3: HybridEP dispatch (replaces allgather + ragged_all_to_all + local_permute)
-        dispatched, tokens_per_expert, dispatched_probs = hybrid_ep_dispatch_ffi(
-            x_2d, routing_map.astype(jnp.bool_), probs=dense_probs.astype(jnp.float32),
-            pad_multiple=pad,
-        )
+        # Step 3: HybridEP dispatch with custom_vjp (backward = combine)
+        # Set autodiff config (non-traced Python values only)
+        _hybridep_autodiff._pad_multiple = pad
+        _hybridep_autodiff._use_ffi = True
+
+        # stop_gradient on routing decisions — non-differentiable, passed as explicit args
+        rm_stopped = jax.lax.stop_gradient(routing_map.astype(jnp.bool_))
+        probs_stopped = jax.lax.stop_gradient(dense_probs.astype(jnp.float32))
+
+        dispatched, tpe_float, dispatched_probs = dispatch_differentiable(x_2d, rm_stopped, probs_stopped)
+        tokens_per_expert = tpe_float.astype(jnp.int32)
 
         # Step 4: Expert compute — reuse existing gmm with tokens_per_expert as group_sizes
         # TE GMM handles the padded-per-expert layout natively.
@@ -1884,10 +1891,10 @@ class RoutedMoE(nnx.Module):
               intermediate_output * dispatched_probs[:intermediate_output.shape[0], None]
           ).astype(jnp.bfloat16)
 
-        # HybridEP combine (replaces local_unpermute + ragged_all_to_all + unpermute)
+        # HybridEP combine with custom_vjp (backward = dispatch)
         if intermediate_output.dtype != jnp.bfloat16:
           intermediate_output = intermediate_output.astype(jnp.bfloat16)
-        output = hybrid_ep_combine_ffi(intermediate_output, pad_multiple=pad)
+        output = combine_differentiable(intermediate_output, rm_stopped)
         output = output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
 
       elif self.config.use_ring_of_experts:
