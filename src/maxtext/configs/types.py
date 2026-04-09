@@ -997,6 +997,10 @@ class RematAndOffload(BaseModel):
       RematLocation.REMAT,
       description="Remat policy for the second MoE layer's output.",
   )
+  moe_dispatch: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for HybridEP dispatch output. Set to 'device' to avoid remat re-execution of dispatch FFI.",
+  )
   query_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the query projection.")
   key_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the key projection.")
   value_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the value projection.")
@@ -2426,6 +2430,7 @@ class MaxTextConfig(
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",
+          "moe_dispatch",
           "query_proj",
           "key_proj",
           "value_proj",
