@@ -215,6 +215,7 @@ forward_pass_only: false # skip gradient computation in train_step (forward pass
 te_router_and_permutation_impl: false # whether to use TransformerEngine fused router and permutation kernels for MoE routing and token dispatch/combine
 moe_permutation_group_align_size: 128 # alignment size for MoE permutation group padding (MT and TE paths), set to 0 to disable
 te_use_gmm: false # whether to use the TE GMM implementation for MoE matmuls
+te_moe_block: false # whether to use TransformerEngine's fused EP MoEBlock for routed MoE layers
 te_gmm_quantization: "" # quantization mode for TE GMM matmuls, must be specified when te_use_gmm is true.
 fused_moe_mlp: false # fuse wi_0 and wi_1 grouped GEMMs into one call, analogous to fused_mlp for dense models
 use_gather_mosaic_kernel: false # whether to use a custom mosaic kernel for token gather ops
