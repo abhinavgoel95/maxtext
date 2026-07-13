@@ -727,8 +727,10 @@ class MoEGeneral(BaseModel):
   )
   shard_exp_on_fsdp: bool = Field(
       False,
-      description="Shard the expert dimension of the MLP weights on the FSDP axis, "
-      "and recommended only when num_experts is a multiple of fsdp_parallelism",
+      description=(
+          "Shard the MoE expert dimension over both expert and FSDP axes. FSDP is gathered before expert "
+          "compute and does not contribute to expert routing. num_experts must be divisible by EP * FSDP."
+      ),
   )
   use_2d_fsdp_sharding: bool = Field(
       False,
@@ -2145,6 +2147,44 @@ class MaxTextConfig(
     """This method is a no-op because `pyconfig` handles model-specific config loading."""
     return values
 
+  def _validate_shard_exp_on_fsdp(self):
+    """Validates combined expert and FSDP sharding when sizes are explicit."""
+    if not self.shard_exp_on_fsdp:
+      return
+
+    tensor_parallelism_factors = (
+        self.ici_tensor_parallelism,
+        self.dcn_tensor_parallelism,
+        self.ici_tensor_sequence_parallelism,
+        self.dcn_tensor_sequence_parallelism,
+        self.ici_tensor_transpose_parallelism,
+        self.dcn_tensor_transpose_parallelism,
+    )
+    if any(size > 1 for size in tensor_parallelism_factors):
+      raise ValueError(
+          "shard_exp_on_fsdp does not currently support tensor or tensor-transpose parallelism."
+      )
+
+    parallelism_factors = (
+        self.ici_fsdp_parallelism,
+        self.dcn_fsdp_parallelism,
+        self.ici_expert_parallelism,
+        self.dcn_expert_parallelism,
+    )
+
+    # An axis set to -1 is resolved during mesh creation. RoutedMoE performs
+    # the definitive divisibility check using the resolved mesh sizes.
+    if -1 in parallelism_factors:
+      return
+
+    combined_expert_shards = prod(parallelism_factors)
+    if self.num_experts % combined_expert_shards:
+      raise ValueError(
+          "shard_exp_on_fsdp requires num_experts to be divisible by "
+          "expert_parallelism * fsdp_parallelism. "
+          f"Got num_experts={self.num_experts} and combined parallelism={combined_expert_shards}."
+      )
+
   def validate_ragged_buffer_factor(self):
     if self.ragged_buffer_factor <= 0:
       return  # Nothing to validate if not using ragged buffer factor
@@ -2878,6 +2918,8 @@ class MaxTextConfig(
           "incompatibility between tokamax's GroupSizes vmap_rule and JAX's scan batching. "
           "Please set use_tokamax_gmm=False."
       )
+
+    self._validate_shard_exp_on_fsdp()
 
     # Final string-to-enum conversions if they haven't been coerced by pydantic yet.
     if isinstance(self.decoder_block, str):

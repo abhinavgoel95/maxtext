@@ -67,7 +67,7 @@ logical_axis_rules: [
                       ['layers', 'stage'],
                       ['cache_heads', ['tensor']],
                       ['exp', 'expert'],
-                      ['exp_with_fsdp', 'fsdp'],
+                      ['exp_with_fsdp', ['expert', 'fsdp']],
                       ['paged_kv_heads', ['tensor']],
                       ['engram_dim', ['tensor']],
                     ]

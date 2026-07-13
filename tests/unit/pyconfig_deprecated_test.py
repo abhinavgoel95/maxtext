@@ -18,6 +18,7 @@ import unittest
 import os.path
 
 from maxtext.configs import pyconfig
+from maxtext.configs import pyconfig_deprecated
 from maxtext.configs.pyconfig_deprecated import resolve_config_path
 from maxtext.utils.globals import MAXTEXT_PKG_DIR
 from tests.utils.test_helpers import get_test_config_path
@@ -25,6 +26,33 @@ from tests.utils.test_helpers import get_test_config_path
 
 class PyconfigTest(unittest.TestCase):
   """Tests for 'pyconfig.py'."""
+
+  def _shard_exp_on_fsdp_keys(self, num_experts=256, fsdp=64, expert=2):
+    return {
+        "shard_exp_on_fsdp": True,
+        "num_experts": num_experts,
+        "ici_fsdp_parallelism": fsdp,
+        "dcn_fsdp_parallelism": 1,
+        "ici_expert_parallelism": expert,
+        "dcn_expert_parallelism": 1,
+        "ici_tensor_parallelism": 1,
+        "dcn_tensor_parallelism": 1,
+        "ici_tensor_sequence_parallelism": 1,
+        "dcn_tensor_sequence_parallelism": 1,
+        "ici_tensor_transpose_parallelism": 1,
+        "dcn_tensor_transpose_parallelism": 1,
+    }
+
+  def test_shard_exp_on_fsdp_allows_expert_parallelism(self):
+    for fsdp, expert in ((64, 2), (32, 4)):
+      with self.subTest(fsdp=fsdp, expert=expert):
+        pyconfig_deprecated.validate_shard_expert_on_fsdp(
+            self._shard_exp_on_fsdp_keys(fsdp=fsdp, expert=expert)
+        )
+
+  def test_shard_exp_on_fsdp_requires_combined_divisibility(self):
+    with self.assertRaisesRegex(ValueError, "expert_parallelism.*fsdp_parallelism"):
+      pyconfig_deprecated.validate_shard_expert_on_fsdp(self._shard_exp_on_fsdp_keys(num_experts=192))
 
   def test_basic_override(self):
     raw_keys = {"megablox": None, "foo": ["bar", "baz"]}

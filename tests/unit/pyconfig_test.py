@@ -27,6 +27,23 @@ from tests.utils.test_helpers import get_test_config_path, get_post_train_test_c
 class PyconfigTest(unittest.TestCase):
   """Tests for 'pyconfig.py'."""
 
+  def test_shard_exp_on_fsdp_allows_expert_parallelism(self):
+    for fsdp, expert in ((64, 2), (32, 4)):
+      with self.subTest(fsdp=fsdp, expert=expert):
+        config = pyconfig.initialize(
+            [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+            skip_jax_distributed_system=True,
+            run_name=f"shard-exp-fsdp-{fsdp}-ep-{expert}",
+            enable_checkpointing=False,
+            model_name="deepseek3-671b",
+            ici_data_parallelism=1,
+            ici_fsdp_parallelism=fsdp,
+            ici_expert_parallelism=expert,
+            shard_exp_on_fsdp=True,
+        )
+        self.assertEqual(config.ici_fsdp_parallelism, fsdp)
+        self.assertEqual(config.ici_expert_parallelism, expert)
+
   def test_empty_string_parse_as_empty_string(self):
     config = pyconfig.initialize(
         [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],

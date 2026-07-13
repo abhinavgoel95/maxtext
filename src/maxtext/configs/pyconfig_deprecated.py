@@ -1223,11 +1223,40 @@ def validate_ring_of_experts_parallelism(raw_keys):
 
 
 def validate_shard_expert_on_fsdp(raw_keys):
-  if raw_keys["shard_exp_on_fsdp"] and raw_keys["num_experts"] % raw_keys["ici_fsdp_parallelism"] != 0:
-    raise ValueError("shard_exp_on_fsdp requires num_experts is divisiable by ici_fsdp_parallelism.")
-  if raw_keys["shard_exp_on_fsdp"] and (using_tensor_parallelism(raw_keys) or using_expert_parallelism(raw_keys)):
+  if not raw_keys["shard_exp_on_fsdp"]:
+    return
+
+  tensor_parallelism_factors = (
+      raw_keys["ici_tensor_parallelism"],
+      raw_keys["dcn_tensor_parallelism"],
+      raw_keys["ici_tensor_sequence_parallelism"],
+      raw_keys["dcn_tensor_sequence_parallelism"],
+      raw_keys["ici_tensor_transpose_parallelism"],
+      raw_keys["dcn_tensor_transpose_parallelism"],
+  )
+  if any(size > 1 for size in tensor_parallelism_factors):
     raise ValueError(
-        "shard_exp_on_fsdp requires ici_expert_parallelism = 1 and ici_tensor_parallelism/ici_tensor_transpose_parallelism = 1."
+        "shard_exp_on_fsdp does not currently support tensor or tensor-transpose parallelism."
+    )
+
+  parallelism_factors = (
+      raw_keys["ici_fsdp_parallelism"],
+      raw_keys["dcn_fsdp_parallelism"],
+      raw_keys["ici_expert_parallelism"],
+      raw_keys["dcn_expert_parallelism"],
+  )
+
+  # An axis set to -1 is resolved during mesh creation. RoutedMoE performs the
+  # definitive divisibility check using the resolved mesh sizes.
+  if -1 in parallelism_factors:
+    return
+
+  combined_expert_shards = prod(parallelism_factors)
+  if raw_keys["num_experts"] % combined_expert_shards:
+    raise ValueError(
+        "shard_exp_on_fsdp requires num_experts to be divisible by "
+        "expert_parallelism * fsdp_parallelism. "
+        f"Got num_experts={raw_keys['num_experts']} and combined parallelism={combined_expert_shards}."
     )
 
 

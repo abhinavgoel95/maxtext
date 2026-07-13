@@ -405,9 +405,10 @@ class RoutedMoE(nnx.Module):
     )
 
     if self.config.shard_exp_on_fsdp:
-      # special sharding for dsv3
-      self.wi_kernel_axes = ("embed_moe", None, "mlp_moe")
-      self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
+      # Store the expert dimension over both EP and FSDP. Before the GMM,
+      # FSDP is gathered while EP remains sharded for local expert compute.
+      self.wi_kernel_axes = ("exp_with_fsdp", None, "mlp_moe")
+      self.wo_kernel_axes = ("exp_with_fsdp", "mlp_moe", None)
     elif self.config.use_2d_fsdp_sharding:
       self.wi_kernel_axes = ("embed_moe", "mlp_moe", None)
       self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
@@ -427,6 +428,20 @@ class RoutedMoE(nnx.Module):
       self._expert_parallelism_name = "attn_dp_expert"
     else:
       self._expert_parallelism_name = "expert"
+
+    if self.config.shard_exp_on_fsdp:
+      fsdp_size = self.mesh.shape.get("fsdp", 1)
+      expert_size = self.get_expert_parallelism_size()
+      combined_expert_shards = fsdp_size * expert_size
+      if self.num_experts % combined_expert_shards:
+        raise ValueError(
+            "shard_exp_on_fsdp requires num_experts to be divisible by FSDP * EP. "
+            f"Got num_experts={self.num_experts}, fsdp={fsdp_size}, expert={expert_size}."
+        )
+      if self.get_tensor_parallelism_size() > 1 or self.get_tensor_transpose_parallelism_size() > 1:
+        raise ValueError(
+            "shard_exp_on_fsdp does not currently support tensor or tensor-transpose parallelism."
+        )
 
     self.gate = GateLogit(
         in_features_shape=self.moe_expert_input_dim,
@@ -1599,14 +1614,14 @@ class RoutedMoE(nnx.Module):
     if self.config.shard_exp_on_fsdp:
       quantization_rule = qpl.get_current_rule("gmm")
       if quantization_rule and quantization_rule.weight_calibration_method.startswith("fixed"):
-        # special sharding when using static scaling for weights in quantization with shard_exp_on_fsdp
+        # Keep the stored EP x FSDP sharding. The GMM explicitly gathers FSDP.
         wi_base_pspec = self._logical_to_mesh_axes(self.wi_kernel_axes)
         wo_pspec = self._logical_to_mesh_axes(self.wo_kernel_axes)
         weight_gather = True
       else:
-        # special sharding for dsv3 to remove overhead between gmm/AG
-        wi_base_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", None, "mlp_no_fsdp"))
-        wo_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", "mlp_no_fsdp", None))
+        # All-gather FSDP while retaining the EP partition.
+        wi_base_pspec = self._logical_to_mesh_axes(("exp", "embed_tensor_transpose", "mlp_no_fsdp"))
+        wo_pspec = self._logical_to_mesh_axes(("exp", "mlp_no_fsdp", "embed_tensor_transpose"))
     elif self.config.use_2d_fsdp_sharding:
       wi_base_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", "mlp_no_fsdp", None))
       wo_pspec = self._logical_to_mesh_axes(("embed_tensor_transpose", "mlp_no_fsdp", None))
@@ -1839,13 +1854,21 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(selected_experts, w0_bias, w1_bias, wo_bias)
 
-      def get_active_sharding_axes(pspec_dim_axes, tensor_dim_index):
+      logical_expert_axes = self._logical_to_mesh_axes(("exp",))[0]
+      if logical_expert_axes is None:
+        expert_mesh_axes = set()
+      elif isinstance(logical_expert_axes, str):
+        expert_mesh_axes = {logical_expert_axes}
+      else:
+        expert_mesh_axes = set(logical_expert_axes)
+
+      def get_active_sharding_axes(pspec_dim_axes, tensor_dim_index, preserve_expert=False):
         if pspec_dim_axes is None:
           return []
         axes = (pspec_dim_axes,) if isinstance(pspec_dim_axes, str) else pspec_dim_axes
         active = []
         for ax in axes:
-          if ax and self.mesh.shape.get(ax, 1) > 1:
+          if ax and self.mesh.shape.get(ax, 1) > 1 and not (preserve_expert and ax in expert_mesh_axes):
             active.append((ax, tensor_dim_index))
         return active
 
@@ -1853,13 +1876,13 @@ class RoutedMoE(nnx.Module):
       wo_gather_axes = []
 
       if weight_gather:
-        # wi [Experts, In, Hidden] -> Gather Exp(0) and Hidden(2)
+        # wi [Experts, In, Hidden] -> gather FSDP, but preserve EP.
         wi_weight_pspec = wi_pspec if use_fused_wi else w0_pspec
-        wi_gather_axes.extend(get_active_sharding_axes(wi_weight_pspec[0], 0))
+        wi_gather_axes.extend(get_active_sharding_axes(wi_weight_pspec[0], 0, preserve_expert=True))
         wi_gather_axes.extend(get_active_sharding_axes(wi_weight_pspec[2], 2))
 
-        # wo [Experts, Hidden, Out] -> Gather Exp(0) and Hidden(1)
-        wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[0], 0))
+        # wo [Experts, Hidden, Out] -> gather FSDP, but preserve EP.
+        wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[0], 0, preserve_expert=True))
         wo_gather_axes.extend(get_active_sharding_axes(wo_pspec[1], 1))
       gmm_fn = functools.partial(
           gmm,
@@ -2069,21 +2092,21 @@ class RoutedMoE(nnx.Module):
       return output, lb_loss, bias_updates
 
     if self.config.moe_fsdp_use_two_stage_all_gather:
-      # Unshard on fsdp axis
+      # Unshard on FSDP while preserving the expert partition.
       if use_fused_wi:
         wi_kernel = self._maybe_shard_with_logical(
-            wi_kernel, ("exp_with_fsdp", "embed_tensor_transpose", "mlp")
+            wi_kernel, ("exp", "embed_tensor_transpose", "mlp")
         )
       else:
         w0_kernel = self._maybe_shard_with_logical(
-            w0_kernel, ("exp_with_fsdp", "embed_tensor_transpose", "mlp")
+            w0_kernel, ("exp", "embed_tensor_transpose", "mlp")
         )
         w1_kernel = self._maybe_shard_with_logical(
-            w1_kernel, ("exp_with_fsdp", "embed_tensor_transpose", "mlp")
+            w1_kernel, ("exp", "embed_tensor_transpose", "mlp")
         )
 
       # Unshard on fsdp_transpose axis
-      wo_kernel = self._maybe_shard_with_logical(wo_kernel, ("exp_with_fsdp", "mlp", "embed_tensor_transpose"))
+      wo_kernel = self._maybe_shard_with_logical(wo_kernel, ("exp", "mlp", "embed_tensor_transpose"))
 
       # Make sure XLA does not optimize by combining above All-Gather to unshard
       # on FSDP axis and the subsequent unshard on fsdp_transpose axis
@@ -2097,16 +2120,16 @@ class RoutedMoE(nnx.Module):
       # Unshard on both fsdp and fsdp_transpose transpose
       if use_fused_wi:
         wi_kernel = self._maybe_shard_with_logical(
-            wi_kernel, ("exp_with_fsdp", "embed_tensor_transpose", "mlp_no_fsdp")
+            wi_kernel, ("exp", "embed_tensor_transpose", "mlp_no_fsdp")
         )
       else:
         w0_kernel = self._maybe_shard_with_logical(
-            w0_kernel, ("exp_with_fsdp", "embed_tensor_transpose", "mlp_no_fsdp")
+            w0_kernel, ("exp", "embed_tensor_transpose", "mlp_no_fsdp")
         )
         w1_kernel = self._maybe_shard_with_logical(
-            w1_kernel, ("exp_with_fsdp", "embed_tensor_transpose", "mlp_no_fsdp")
+            w1_kernel, ("exp", "embed_tensor_transpose", "mlp_no_fsdp")
         )
-      wo_kernel = self._maybe_shard_with_logical(wo_kernel, ("exp_with_fsdp", "mlp_no_fsdp", "embed_tensor_transpose"))
+      wo_kernel = self._maybe_shard_with_logical(wo_kernel, ("exp", "mlp_no_fsdp", "embed_tensor_transpose"))
 
     if self.get_tensor_transpose_parallelism_size() > 1:
       input_axes = (batch_logical_axis, "activation_norm_length", "activation_embed")
