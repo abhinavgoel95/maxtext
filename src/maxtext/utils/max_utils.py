@@ -1305,7 +1305,25 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   ep_size = mesh.shape.get(ep_axis, 1)
   fsdp_size = mesh.shape.get(fsdp_axis, 1)
 
-  batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  loaded_batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  ga_steps = config.gradient_accumulation_steps
+  if ga_steps < 1 or loaded_batch_size % ga_steps != 0:
+    raise ValueError(
+        f"TE MoE EP loaded batch={loaded_batch_size} must be divisible by positive "
+        f"gradient_accumulation_steps={ga_steps}."
+    )
+  # shaped_batch includes all GA microbatches, but each MoE invocation sees only
+  # one. Keep the loaded-microbatch bound for expanded/fractional input batches,
+  # and cover the training microbatch used during model initialization as well.
+  batch_size = max(loaded_batch_size // ga_steps, config.micro_batch_size_to_train_on)
+  # Evaluation does not use GA; loss_fn slices it to the configured eval batch.
+  if config.eval_interval > 0:
+    batch_size = max(batch_size, config.micro_batch_size_to_eval_on)
+  if batch_size <= 0 or batch_size % (fsdp_size * ep_size) != 0:
+    raise ValueError(
+        f"TE MoE EP per-call batch={batch_size} must be positive and divisible by "
+        f"FSDP*EP={fsdp_size * ep_size}."
+    )
   if config.num_experts % ep_size != 0:
     raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
 
@@ -1349,6 +1367,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
     max_logging.log(
         "Bootstrapping TE MoE EP: "
         f"world={jax.process_count()} rank={jax.process_index()} ep={ep_size} "
+        f"batch_size={batch_size} gradient_accumulation_steps={ga_steps} "
         f"num_experts={config.num_experts} max_tokens_per_rank={max_tokens_per_rank} "
         f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim} "
         f"recv_capacity_factor={recv_capacity_factor} drop_on_overflow={drop_on_overflow}"

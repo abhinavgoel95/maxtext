@@ -1,19 +1,23 @@
 """Tiny NNX integration tests without loading the full MaxText model stack."""
 
+import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from maxtext.common.common_types import DecoderBlockType, ShardMode
 from maxtext.experimental.dense_training_nnx import (
-    _layer_groups, _make_boundaries, _microbatches, _reduce_aux, _restore_gradients,
+    _layer_groups, _make_boundaries, _make_layer_adapter, _microbatches, _reduce_aux, _restore_gradients,
     _te_layer_metrics, validate_training_config,
 )
 from maxtext.experimental.dense_training_schedule import make_training_schedule
+from maxtext.layers import nnx_scan
 from maxtext.utils.globals import EPS
 
 
@@ -47,6 +51,41 @@ class TinyExpertStack(nnx.Module):
       axes = list(axes)
       axes.insert(scan_axis, axes.pop(0))
       setattr(self, name, nnx.Param(jnp.moveaxis(value, 0, scan_axis), out_sharding=tuple(axes)))
+
+
+class FrozenRouterBias(nnx.Variable):
+  """Non-parameter test double for DeepSeek's MoEBiasVar; no TE kernels."""
+
+
+def frozen_expert_output(hidden, gate, experts, bias):
+  scores = jax.nn.softmax(hidden @ gate, axis=-1)
+  # Like bias-assisted routing, the bias selects experts but is not a weight.
+  selected = jnp.argmax(scores + bias, axis=-1)
+  weights = jnp.take_along_axis(scores, selected[..., None], axis=-1)
+  outputs = jnp.tanh(jnp.einsum("...d,edh->...eh", hidden, experts))
+  routed = jnp.take_along_axis(outputs, selected[..., None, None], axis=-2)[..., 0, :]
+  return hidden + weights * routed
+
+
+class TinyFrozenExpertLayer(nnx.Module):
+  def __init__(self, rngs):
+    self.gate = nnx.Module()
+    self.gate.kernel = nnx.Param(jax.random.normal(rngs.params(), (4, 3)) * 0.2,
+                                 out_sharding=("embed", "expert"))
+    self.gate.bias = FrozenRouterBias(jnp.zeros((3,)), out_sharding=("expert",))
+    self.experts = nnx.Param(jax.random.normal(rngs.params(), (3, 4, 4)) * 0.2,
+                             out_sharding=("expert", "embed", "mlp"))
+
+  def __call__(self, hidden, *, decoder_segment_ids, decoder_positions, deterministic, model_mode):
+    del decoder_segment_ids, decoder_positions, deterministic, model_mode
+    # Exercise actual adapter scan-axis removal for the non-Param variable.
+    assert self.gate.bias.shape == (3,)
+    assert self.gate.bias.get_metadata()["out_sharding"] == ("expert",)
+    hidden = frozen_expert_output(hidden, self.gate.kernel[...], self.experts[...], self.gate.bias[...])
+    self.sow(nnx.Intermediate, "te_moe_capacity_overflow", jnp.bool_(False))
+    self.sow(nnx.Intermediate, "te_moe_total_recv_tokens", jnp.int32(hidden.shape[0] * hidden.shape[1]))
+    self.sow(nnx.Intermediate, "te_moe_recv_capacity_per_rank", jnp.int32(128))
+    return hidden, None
 
 
 class TinyDecoder(nnx.Module):
@@ -296,6 +335,81 @@ class DenseTrainingNnxTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "receive-capacity"):
       _te_layer_metrics({}, required=True)
 
+  def test_frozen_router_bias_full_remat_preserves_state_and_gradients(self):
+    # Import the real bookkeeping without optional configuration dependencies.
+    # Only model classes and the remat option helper are doubles; the adapter,
+    # scanned stack construction, metadata helpers, and schedules are real.
+    with mock.patch.dict(sys.modules, {"maxtext.configs.pyconfig": SimpleNamespace(HyperParameters=object)}):
+      from maxtext.utils import maxtext_utils_nnx
+
+    model_modules = {
+        "maxtext.models.llama2": SimpleNamespace(LlamaDecoderLayer=TinyFrozenExpertLayer),
+        "maxtext.models.deepseek": SimpleNamespace(
+            DeepSeekDenseLayer=TinyFrozenExpertLayer, DeepSeekMoELayer=TinyFrozenExpertLayer),
+    }
+    bias_values = jnp.array([[0.5, -0.2, -0.3], [-0.2, 0.5, -0.3], [-0.3, -0.2, 0.5]])
+    for scan_axis in (0, 1):
+      with self.subTest(scan_axis=scan_axis):
+        model = TinyTransformer()
+        del model.decoder.layers
+        stack = nnx_scan.create_scanned_layers(
+            TinyFrozenExpertLayer, length=3, param_scan_axis=scan_axis,
+            metadata_axis_name="moe_layers", rngs=nnx.Rngs(7),
+        )
+        stack.gate.bias[...] = bias_values
+        model.decoder.moe_layers = stack
+        self.assertEqual(stack.gate.bias.shape, (3, 3))
+        self.assertEqual(stack.gate.bias.get_metadata()["param_scan_axis"], 0)
+        self.assertEqual(stack.gate.bias.get_metadata()["out_sharding"], ("moe_layers", "expert"))
+        original_state = nnx.state(model, nnx.Not(nnx.Param))
+        all_params = nnx.state(model, nnx.Param)
+        self.assertNotIn("bias", all_params["decoder"]["moe_layers"]["gate"])
+        config = SimpleNamespace(decoder_block=DecoderBlockType.DEEPSEEK, param_scan_axis=scan_axis,
+                                 remat_policy="full", te_moe_block=True)
+        with mock.patch.dict(sys.modules, model_modules), mock.patch.multiple(
+            "maxtext.utils", create=True, maxtext_utils_nnx=maxtext_utils_nnx,
+            maxtext_utils=SimpleNamespace(should_prevent_cse_in_remat=lambda _: False),
+        ):
+          apply, params, state = _make_layer_adapter(stack, config, "moe_layers", 3)
+        prefix, head, boundary = _make_boundaries(model, config, loss_from_logits, ("moe_layers",))
+        data = _microbatches(make_data(3), 3, 2)
+
+        def reference(weights, biases=bias_values):
+          total = jnp.float32(0)
+          stacked = weights["decoder"]["moe_layers"]
+          gates = jnp.moveaxis(stacked["gate"]["kernel"].get_value(), scan_axis, 0)
+          experts = jnp.moveaxis(stacked["experts"].get_value(), scan_axis, 0)
+          for mb in range(3):
+            batch = jax.tree.map(lambda x: x[mb], data)
+            hidden = weights["token_embedder"]["embedding"].get_value()[batch["inputs"]]
+            hidden *= weights["decoder"]["prefix_scale"].get_value()
+            for layer in range(3):
+              hidden = frozen_expert_output(hidden, gates[layer], experts[layer], biases[layer])
+            logits = hidden @ weights["token_embedder"]["embedding"].get_value().T
+            logits += weights["decoder"]["head_bias"].get_value()
+            total += loss_from_logits(logits, batch, config, None)[0]
+          return total
+
+        expected_loss, expected_grads = jax.jit(jax.value_and_grad(reference))(all_params)
+        self.assertGreater(float(jnp.abs(expected_loss - reference(all_params, jnp.zeros_like(bias_values)))), 1e-5)
+        for schedule_name in ("serial", "dual_pipe"):
+          with self.subTest(schedule=schedule_name):
+            schedule = make_training_schedule(
+                prefix, (apply,), head, schedule=schedule_name, layer_has_aux=True, reduce_aux=_reduce_aux,
+            )
+            loss, _, layer_grads, boundary_grads = jax.jit(schedule)((params,), (state,), boundary, data)
+            grads = _restore_gradients(layer_grads, boundary_grads, scan_axis, ("moe_layers",))
+            np.testing.assert_allclose(loss, expected_loss, rtol=2e-5, atol=2e-6)
+            self.assert_tree_allclose(grads, expected_grads)
+            self.assertNotIn("bias", grads["decoder"]["moe_layers"]["gate"])
+            self.assert_tree_allclose(nnx.state(model, nnx.Not(nnx.Param)), original_state)
+            updated_model = nnx.clone(model)
+            optimizer = nnx.Optimizer(updated_model, optax.sgd(0.01), wrt=nnx.Param)
+            optimizer.update(updated_model, grads)
+            self.assert_tree_allclose(nnx.state(updated_model, nnx.Param),
+                                     jax.tree.map(lambda p, g: p - 0.01 * g, all_params, expected_grads))
+            self.assert_tree_allclose(nnx.state(updated_model, nnx.Not(nnx.Param)), original_state)
+
   def test_deepseek_validation_and_group_layout(self):
     config = SimpleNamespace(
         decoder_block=DecoderBlockType.DEEPSEEK, scan_layers=True, inhomogeneous_layer_cycle_interval=1,
@@ -305,16 +419,22 @@ class DenseTrainingNnxTest(unittest.TestCase):
         routed_bias=False, routed_bias_update_rate=0, num_vocab_tiling=1,
     )
     validate_training_config(config)
+    frozen_bias = SimpleNamespace(**{**vars(config), "routed_bias": True})
+    validate_training_config(frozen_bias)
     self.assertEqual(_layer_groups(config), (("dense_layers", 1), ("moe_layers", 3)))
     no_dense = SimpleNamespace(**{**vars(config), "first_num_dense_layers": 0})
     validate_training_config(no_dense)
     self.assertEqual(_layer_groups(no_dense), (("moe_layers", 4),))
     for field, value in (("quantization", "te_mxfp8"), ("te_gmm_quantization", "te_mxfp8"),
                          ("te_moe_block", False), ("load_balance_loss_weight", 0.01),
-                         ("routed_bias", True), ("routed_bias_update_rate", 0.01),
+                         ("routed_bias_update_rate", 0.01),
                          ("first_num_dense_layers", 4)):
       with self.subTest(field=field), self.assertRaises(ValueError):
-        validate_training_config(SimpleNamespace(**{**vars(config), field: value}))
+        validate_training_config(SimpleNamespace(**{**vars(frozen_bias), field: value}))
+    llama = SimpleNamespace(**{**vars(config), "decoder_block": DecoderBlockType.LLAMA2,
+                               "num_experts": 1, "te_moe_block": False, "routed_bias": True})
+    with self.assertRaisesRegex(ValueError, "routed_bias"):
+      validate_training_config(llama)
 
 
 if __name__ == "__main__":

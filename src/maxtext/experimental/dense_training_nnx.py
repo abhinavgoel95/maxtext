@@ -38,8 +38,10 @@ def validate_training_config(config):
       raise ValueError("DeepSeek dual_pipe currently requires num_experts>1 and te_moe_block=true")
     if config.quantization != "te_no_quant" or config.te_gmm_quantization != "te_no_quant":
       raise ValueError("DeepSeek dual_pipe requires quantization=te_no_quant and te_gmm_quantization=te_no_quant")
-    if config.load_balance_loss_weight != 0 or config.routed_bias or config.routed_bias_update_rate != 0:
-      raise ValueError("DeepSeek dual_pipe requires load_balance_loss_weight=0, routed_bias=false, routed_bias_update_rate=0")
+    # DeepSeek's frozen MoEBiasVar is already carried as read-only layer state.
+    # Bias updates and auxiliary load-balancing loss are not implemented here.
+    if config.load_balance_loss_weight != 0 or config.routed_bias_update_rate != 0:
+      raise ValueError("DeepSeek dual_pipe requires load_balance_loss_weight=0 and routed_bias_update_rate=0 (frozen bias)")
   elif config.num_experts != 1 or getattr(config, "te_moe_block", False):
     raise ValueError("Llama dual_pipe currently supports dense layers only")
   if getattr(config, "training_objective", "causal_lm") != "causal_lm":
@@ -57,9 +59,11 @@ def validate_training_config(config):
       "use_multimodal", "use_audio", "learn_to_init_mode",
       "use_tunix_gradient_accumulation", "shard_optimizer_over_data",
       "optimizer_memory_host_offload", "use_indexer", "enable_diloco",
-      "routed_bias", "retry_when_tokens_dropped", "use_qk_clip", "engram_layers",
+      "retry_when_tokens_dropped", "use_qk_clip", "engram_layers",
   )
   enabled = [name for name in unsupported if getattr(config, name, False)]
+  if not is_deepseek and getattr(config, "routed_bias", False):
+    enabled.append("routed_bias")
   if getattr(getattr(config, "lora", None), "enable_lora", False):
     enabled.append("lora.enable_lora")
   if enabled:
