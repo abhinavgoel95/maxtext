@@ -108,12 +108,13 @@ def get_first_step(model, state):
 # -----------------------------------------------------------------------------
 
 
-def causal_lm_loss(logits, data, config, mesh):
-  """Return masked cross-entropy sum, normalized z-loss metric, and token count.
+def loss_from_logits(logits, data, config, mesh, loss_mask=None):
+  """Return masked cross-entropy sum, z-loss sum, and token count.
 
   Shared by ordinary training and the experimental dense 1F1B schedule. The
   cross-entropy already includes the configured z-loss regularization; the
   separately returned z-loss is a metric and must not be added to it again.
+  Callers retain their existing loss and metric normalization.
   """
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
   xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
@@ -131,9 +132,9 @@ def causal_lm_loss(logits, data, config, mesh):
       config.shard_mode,
       debug_sharding=config.debug_sharding,
   )
-  mask = data["targets_segmentation"] != 0
+  mask = data["targets_segmentation"] != 0 if loss_mask is None else loss_mask
   total_weights = jnp.sum(mask)
-  return jnp.sum(xent * mask), jnp.sum(z_loss * mask) / (total_weights + EPS), total_weights
+  return jnp.sum(xent * mask), jnp.sum(z_loss * mask), total_weights
 
 
 def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_train=True):
@@ -240,7 +241,6 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   if indexer_losses_state is not None:
     intermediate_outputs["indexer_losses"] = indexer_losses_state.to_pure_dict()
 
-  z_loss_is_normalized = False
   if (config.use_indexer and not config.indexer_sparse_training) and is_train:
     # In Dense Warm-up stage, we skip main model loss calculation for efficiency.
     # The main model parameters are frozen and only the indexer is trained via KL divergence.
@@ -250,39 +250,15 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     hidden_state_key = ("decoder", "hidden_states")
     hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
     xent_sum, total_z_loss = vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train)
-  elif not is_block_diffusion:
-    xent_sum, total_z_loss, _ = causal_lm_loss(logits, data, config, model.mesh)
-    z_loss_is_normalized = True
   else:
-    logits = block_diffusion_target_alignment.align_logits_to_targets(
-        logits,
-        config.block_diffusion_logit_alignment,
-        target_positions,
-        data["targets_segmentation"] != 0,
-    )
-    one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
-    xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
-
-    xent = sharding.maybe_shard_with_logical(
-        xent,
-        ("activation_embed_and_logits_batch", "activation_length"),
-        model.mesh,
-        config.shard_mode,
-        debug_sharding=config.debug_sharding,
-    )
-    z_loss = sharding.maybe_shard_with_logical(
-        z_loss,
-        ("activation_embed_and_logits_batch", "activation_length"),
-        model.mesh,
-        config.shard_mode,
-        debug_sharding=config.debug_sharding,
-    )
-
-    xent = xent * targets_loss_mask
-    z_loss = z_loss * targets_loss_mask
-
-    xent_sum = jnp.sum(xent)
-    total_z_loss = jnp.sum(z_loss)
+    if is_block_diffusion:
+      logits = block_diffusion_target_alignment.align_logits_to_targets(
+          logits,
+          config.block_diffusion_logit_alignment,
+          target_positions,
+          data["targets_segmentation"] != 0,
+      )
+    xent_sum, total_z_loss, _ = loss_from_logits(logits, data, config, model.mesh, loss_mask=targets_loss_mask)
 
   if is_block_diffusion:
     assert targets_loss_mask is not None
@@ -307,8 +283,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     loss = xent_sum / (total_weights + EPS)
 
   # We keep z-loss normalized by total_weights.
-  if not z_loss_is_normalized:
-    total_z_loss = total_z_loss / (total_weights + EPS)
+  total_z_loss = total_z_loss / (total_weights + EPS)
 
   # Calculate and Add MTP Loss
   mtp_loss = 0.0
@@ -433,7 +408,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   if getattr(config, "gradient_accumulation_schedule", "serial") == "dual_pipe":
     from maxtext.experimental.dense_training_nnx import dualpipe_loss_and_grad  # pylint: disable=import-outside-toplevel
 
-    loss, aux, raw_grads = dualpipe_loss_and_grad(config, loss_model, params_shardings, data, causal_lm_loss)
+    loss, aux, raw_grads = dualpipe_loss_and_grad(config, loss_model, params_shardings, data, loss_from_logits)
   elif config.gradient_accumulation_steps > 1:
     loss, aux, raw_grads = gradient_accumulation_loss_and_grad(
         loss_fn,

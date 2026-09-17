@@ -10,6 +10,7 @@ import numpy as np
 
 from maxtext.experimental.dense_training_nnx import _make_boundaries, _microbatches, _restore_gradients
 from maxtext.experimental.dense_training_schedule import make_training_schedule
+from maxtext.utils.globals import EPS
 
 
 class TinyEmbedding(nnx.Module):
@@ -53,13 +54,14 @@ class TinyTransformer(nnx.Module):
     self.mesh = None
 
 
-def causal_lm_loss(logits, data, config, mesh):
-  del config, mesh
+def loss_from_logits(logits, data, config, mesh, loss_mask=None):
+  del mesh
   logprobs = jax.nn.log_softmax(logits)
   xent = -jnp.take_along_axis(logprobs, data["targets"][..., None], axis=-1)[..., 0]
-  mask = data["targets_segmentation"] != 0
-  xent_sum = jnp.sum(jnp.where(mask, xent, 0))
-  return xent_sum, jnp.float32(0), jnp.sum(mask)
+  z_loss = getattr(config, "z_loss_multiplier", 0.0) * jax.nn.logsumexp(logits, axis=-1) ** 2
+  mask = data["targets_segmentation"] != 0 if loss_mask is None else loss_mask
+  xent_sum = jnp.sum(jnp.where(mask, xent + z_loss, 0))
+  return xent_sum, jnp.sum(jnp.where(mask, z_loss, 0)), jnp.sum(mask)
 
 
 def layer_apply(params, hidden, state, positions, segments):
@@ -99,7 +101,7 @@ class DenseTrainingNnxTest(unittest.TestCase):
     model = TinyTransformer()
     original_layers = model.decoder.layers
     original_state = nnx.state(model)
-    prefix, head, params = _make_boundaries(model, SimpleNamespace(), causal_lm_loss)
+    prefix, head, params = _make_boundaries(model, SimpleNamespace(), loss_from_logits)
     self.assertIs(model.decoder.layers, original_layers)
     self.assertNotIn("layers", params["decoder"])
     self.assert_tree_allclose(nnx.state(model), original_state)
@@ -112,12 +114,31 @@ class DenseTrainingNnxTest(unittest.TestCase):
     self.assertIs(model.decoder.layers, original_layers)
     self.assert_tree_allclose(nnx.state(model), original_state)
 
+  def test_boundary_normalizes_nonzero_z_loss_metric_once(self):
+    model = TinyTransformer()
+    config = SimpleNamespace(z_loss_multiplier=0.01)
+    prefix, head, params = _make_boundaries(model, config, loss_from_logits)
+    for empty in (False, True):
+      with self.subTest(empty=empty):
+        data = make_data(1, empty=empty)
+        hidden = prefix(params, data)
+        logits = model.decoder.apply_output_head(model.token_embedder, hidden, deterministic=True, model_mode="train")
+        expected_loss, z_loss_sum, count = loss_from_logits(logits, data, config, model.mesh)
+        loss, aux = jax.jit(head)(params, hidden, data)
+        np.testing.assert_allclose(loss, expected_loss)
+        np.testing.assert_allclose(aux["z_loss"], z_loss_sum / (count + EPS))
+        np.testing.assert_allclose(aux["xent_sum"], expected_loss)
+        self.assertEqual(aux["total_weights"], count)
+        if not empty:
+          self.assertGreater(float(z_loss_sum), 0.0)
+          self.assertGreater(int(count), 1)
+
   def test_restore_gradients_recovers_axis_tree_and_metadata(self):
     for scan_axis in (0, 1):
       with self.subTest(scan_axis=scan_axis):
         model = TinyTransformer(scan_axis=scan_axis)
         params = nnx.state(model, nnx.Param)
-        _, _, boundary = _make_boundaries(model, SimpleNamespace(), causal_lm_loss)
+        _, _, boundary = _make_boundaries(model, SimpleNamespace(), loss_from_logits)
         layers = nnx.state(model.decoder.layers, nnx.Param)
         leading_layers = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0) * 2, layers)
         boundary_grads = jax.tree.map(lambda x: x * 2, boundary)
@@ -148,7 +169,7 @@ class DenseTrainingNnxTest(unittest.TestCase):
         with self.subTest(microbatches=microbatches, empty=empty):
           model = TinyTransformer(scan_axis=1)
           graphdef, all_params, all_state = nnx.split(model, nnx.Param, ...)
-          prefix, head, boundary_params = _make_boundaries(model, SimpleNamespace(), causal_lm_loss)
+          prefix, head, boundary_params = _make_boundaries(model, SimpleNamespace(), loss_from_logits)
           _, layer_params, layer_state = nnx.split(model.decoder.layers, nnx.Param, ...)
           layer_params = jax.tree.map(lambda x: jnp.moveaxis(x, 1, 0), layer_params)
           data = _microbatches(make_data(microbatches, empty), count=microbatches, micro_batch_size=2)
@@ -168,7 +189,7 @@ class DenseTrainingNnxTest(unittest.TestCase):
               logits = local_model.decoder.apply_output_head(
                   local_model.token_embedder, hidden, deterministic=True, model_mode="train"
               )
-              loss, _, weights = causal_lm_loss(logits, batch, None, None)
+              loss, _, weights = loss_from_logits(logits, batch, None, None)
               total_loss += loss
               total_weights += weights
             return total_loss / jnp.maximum(total_weights, 1)

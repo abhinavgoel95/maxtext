@@ -9,15 +9,27 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
-from maxtext.common.common_types import MODEL_MODE_TRAIN
+from maxtext.common.common_types import DecoderBlockType, MODEL_MODE_TRAIN, ShardMode
 from maxtext.experimental.dense_training_schedule import make_training_schedule
+from maxtext.utils.globals import EPS
 
 
 def validate_training_config(config):
-  # Import the full MaxText model dependencies only for this opt-in path.
-  from maxtext.experimental.dense_schedule_nnx import validate_config
-
-  validate_config(config)
+  """Reject model/state modes the dense fused layer schedule does not support."""
+  if config.decoder_block != DecoderBlockType.LLAMA2:
+    raise ValueError("dual_pipe currently supports decoder_block=llama2 only")
+  if not config.scan_layers or config.inhomogeneous_layer_cycle_interval != 1:
+    raise ValueError("dual_pipe requires scan_layers=true and inhomogeneous_layer_cycle_interval=1")
+  if config.num_decoder_layers < 1:
+    raise ValueError("At least one decoder layer is required")
+  if config.shard_mode != ShardMode.AUTO:
+    raise ValueError("dual_pipe currently requires shard_mode=auto")
+  if config.remat_policy not in ("none", "full"):
+    raise ValueError("dual_pipe requires remat_policy=none or remat_policy=full")
+  if config.dropout_rate != 0:
+    raise ValueError("dual_pipe requires dropout_rate=0; layer state is read-only")
+  if config.quantization or config.num_experts != 1 or config.mtp_num_layers != 0:
+    raise ValueError("Use unquantized dense layers: quantization='', num_experts=1, mtp_num_layers=0")
   if getattr(config, "training_objective", "causal_lm") != "causal_lm":
     raise ValueError("dual_pipe currently supports training_objective=causal_lm only")
   if getattr(config, "attention_type", "global") == "block_diffusion":
@@ -27,18 +39,64 @@ def validate_training_config(config):
   if getattr(config, "mhc_expansion_rate", 1) != 1:
     raise ValueError("dual_pipe currently requires mhc_expansion_rate=1")
   unsupported = (
+      "use_qwix_quantization", "use_manual_quantization", "quantize_kvcache",
+      "record_internal_nn_metrics", "parameter_memory_host_offload",
+      "using_pipeline_parallelism", "use_batch_split_schedule", "te_moe_block",
+      "use_multimodal", "use_audio", "learn_to_init_mode",
       "use_tunix_gradient_accumulation", "shard_optimizer_over_data",
       "optimizer_memory_host_offload", "use_indexer", "enable_diloco",
       "routed_bias", "retry_when_tokens_dropped", "use_qk_clip", "engram_layers",
   )
   enabled = [name for name in unsupported if getattr(config, name, False)]
+  if getattr(getattr(config, "lora", None), "enable_lora", False):
+    enabled.append("lora.enable_lora")
   if enabled:
     raise ValueError(f"Unsupported with gradient_accumulation_schedule=dual_pipe: {', '.join(enabled)}")
   if not hasattr(jax, "fwd_and_bwd"):
     raise RuntimeError("dual_pipe requires a JAX build providing jax.fwd_and_bwd")
 
 
-def _make_boundaries(model, config, causal_lm_loss):
+def _make_layer_adapter(layers, config):
+  """Expose the scanned Llama stack as a pure, single-layer function.
+
+  The schedule uses a leading layer axis for params/state; _restore_gradients
+  restores the original parameter axis afterward. Sharding metadata stays with
+  each variable, with the sliced layer axis removed inside layer_apply.
+  """
+  # Keep heavy model dependencies out of the lightweight NNX bookkeeping tests.
+  from maxtext.models.llama2 import LlamaDecoderLayer
+  from maxtext.utils import maxtext_utils, maxtext_utils_nnx
+
+  if not isinstance(layers, LlamaDecoderLayer):
+    raise TypeError("Expected a scanned LlamaDecoderLayer, not a full model or sequential layer list")
+  graphdef, params, state = nnx.split(layers, nnx.Param, ...)
+  if config.param_scan_axis != 0:
+    params = jax.tree.map(lambda x: jnp.moveaxis(x, config.param_scan_axis, 0), params)
+  params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, config.num_decoder_layers)
+  state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, config.num_decoder_layers)
+
+  def layer_apply(weights, hidden, layer_state, positions, segments):
+    weights, layer_state = maxtext_utils_nnx.nnx_remove_scan_axis((weights, layer_state), "layers")
+    layer = nnx.merge(graphdef, weights, layer_state, copy=True)
+    hidden, _ = layer(
+        hidden,
+        decoder_segment_ids=segments,
+        decoder_positions=positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    return hidden
+
+  if config.remat_policy == "full":
+    layer_apply = jax.checkpoint(
+        layer_apply,
+        policy=jax.checkpoint_policies.nothing_saveable,
+        prevent_cse=maxtext_utils.should_prevent_cse_in_remat(config),
+    )
+  return layer_apply, params, state
+
+
+def _make_boundaries(model, config, loss_from_logits):
   """Reuse MaxText's actual embedding/head methods without carrying layer weights.
 
   The copy changes only Python graph structure, not the caller's model. Both
@@ -64,7 +122,10 @@ def _make_boundaries(model, config, causal_lm_loss):
     logits = local_model.decoder.apply_output_head(
         local_model.token_embedder, hidden, deterministic=True, model_mode=MODEL_MODE_TRAIN
     )
-    xent_sum, z_loss, total_weights = causal_lm_loss(logits, batch, config, local_model.mesh)
+    xent_sum, z_loss_sum, total_weights = loss_from_logits(logits, batch, config, local_model.mesh)
+    # Normal GA sums per-microbatch normalized z-loss metrics. The objective
+    # already includes z-loss regularization; do not add this metric to it.
+    z_loss = z_loss_sum / (total_weights + EPS)
     return xent_sum, {"xent_sum": xent_sum, "z_loss": z_loss, "total_weights": total_weights}
 
   return prefix_apply, loss_apply, params
@@ -97,9 +158,8 @@ def _restore_gradients(layer_grads, boundary_grads, param_scan_axis):
   return nnx.merge_state(boundary_grads, nnx.State({"decoder": {"layers": layer_grads}}))
 
 
-def dualpipe_loss_and_grad(config, model, params_shardings, data, causal_lm_loss):
+def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logits):
   """Drop-in loss/aux/gradient result for train_step, not a separate executable."""
-  from maxtext.experimental.dense_schedule_nnx import make_layer_adapter
   from maxtext.utils.sharding import maybe_shard_with_name
 
   validate_training_config(config)
@@ -120,8 +180,8 @@ def dualpipe_loss_and_grad(config, model, params_shardings, data, causal_lm_loss
 
   params = jax.tree.map(shard, params, params_shardings)
   nnx.update(local_model, params)
-  layer_apply, layer_params, layer_state = make_layer_adapter(local_model.decoder.layers, config)
-  prefix_apply, loss_apply, boundary_params = _make_boundaries(local_model, config, causal_lm_loss)
+  layer_apply, layer_params, layer_state = _make_layer_adapter(local_model.decoder.layers, config)
+  prefix_apply, loss_apply, boundary_params = _make_boundaries(local_model, config, loss_from_logits)
   batch = _microbatches(data, config.gradient_accumulation_steps, config.micro_batch_size_to_train_on)
   schedule = make_training_schedule(prefix_apply, layer_apply, loss_apply, grad_dtype=config.grad_dtype)
   with jax.named_scope("dual_pipe"):
