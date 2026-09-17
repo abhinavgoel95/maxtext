@@ -1,4 +1,4 @@
-"""Opt-in dense 1F1B gradient accumulation for the normal MaxText train step.
+"""Opt-in Llama/DeepSeek 1F1B accumulation for the normal MaxText train step.
 
 The decoder's backward/next-forward layer pair shares one scan body. Embedding
 and loss/head differentiation happen at its boundaries, with fixed parameters
@@ -15,9 +15,10 @@ from maxtext.utils.globals import EPS
 
 
 def validate_training_config(config):
-  """Reject model/state modes the dense fused layer schedule does not support."""
-  if config.decoder_block != DecoderBlockType.LLAMA2:
-    raise ValueError("dual_pipe currently supports decoder_block=llama2 only")
+  """Keep the initial comparison deterministic and free of mutable quantization."""
+  is_deepseek = config.decoder_block == DecoderBlockType.DEEPSEEK
+  if config.decoder_block not in (DecoderBlockType.LLAMA2, DecoderBlockType.DEEPSEEK):
+    raise ValueError("dual_pipe currently supports decoder_block=llama2 or deepseek")
   if not config.scan_layers or config.inhomogeneous_layer_cycle_interval != 1:
     raise ValueError("dual_pipe requires scan_layers=true and inhomogeneous_layer_cycle_interval=1")
   if config.num_decoder_layers < 1:
@@ -28,8 +29,19 @@ def validate_training_config(config):
     raise ValueError("dual_pipe requires remat_policy=none or remat_policy=full")
   if config.dropout_rate != 0:
     raise ValueError("dual_pipe requires dropout_rate=0; layer state is read-only")
-  if config.quantization or config.num_experts != 1 or config.mtp_num_layers != 0:
-    raise ValueError("Use unquantized dense layers: quantization='', num_experts=1, mtp_num_layers=0")
+  if config.quantization not in ("", "te_no_quant") or config.mtp_num_layers != 0:
+    raise ValueError("dual_pipe requires quantization='' or te_no_quant, and mtp_num_layers=0")
+  if is_deepseek:
+    if not 0 <= config.first_num_dense_layers < config.num_decoder_layers:
+      raise ValueError("DeepSeek dual_pipe requires at least one MoE layer and a valid dense prefix")
+    if config.num_experts <= 1 or not config.te_moe_block:
+      raise ValueError("DeepSeek dual_pipe currently requires num_experts>1 and te_moe_block=true")
+    if config.quantization != "te_no_quant" or config.te_gmm_quantization != "te_no_quant":
+      raise ValueError("DeepSeek dual_pipe requires quantization=te_no_quant and te_gmm_quantization=te_no_quant")
+    if config.load_balance_loss_weight != 0 or config.routed_bias or config.routed_bias_update_rate != 0:
+      raise ValueError("DeepSeek dual_pipe requires load_balance_loss_weight=0, routed_bias=false, routed_bias_update_rate=0")
+  elif config.num_experts != 1 or getattr(config, "te_moe_block", False):
+    raise ValueError("Llama dual_pipe currently supports dense layers only")
   if getattr(config, "training_objective", "causal_lm") != "causal_lm":
     raise ValueError("dual_pipe currently supports training_objective=causal_lm only")
   if getattr(config, "attention_type", "global") == "block_diffusion":
@@ -41,7 +53,7 @@ def validate_training_config(config):
   unsupported = (
       "use_qwix_quantization", "use_manual_quantization", "quantize_kvcache",
       "record_internal_nn_metrics", "parameter_memory_host_offload",
-      "using_pipeline_parallelism", "use_batch_split_schedule", "te_moe_block",
+      "using_pipeline_parallelism", "use_batch_split_schedule",
       "use_multimodal", "use_audio", "learn_to_init_mode",
       "use_tunix_gradient_accumulation", "shard_optimizer_over_data",
       "optimizer_memory_host_offload", "use_indexer", "enable_diloco",
@@ -56,8 +68,46 @@ def validate_training_config(config):
     raise RuntimeError("dual_pipe requires a JAX build providing jax.fwd_and_bwd")
 
 
-def _make_layer_adapter(layers, config):
-  """Expose the scanned Llama stack as a pure, single-layer function.
+def _layer_groups(config):
+  """Names and lengths of contiguous homogeneous stacks, in forward order."""
+  if config.decoder_block == DecoderBlockType.DEEPSEEK:
+    groups = (("dense_layers", config.first_num_dense_layers),
+              ("moe_layers", config.num_decoder_layers - config.first_num_dense_layers))
+    return tuple((name, count) for name, count in groups if count)
+  return (("layers", config.num_decoder_layers),)
+
+
+def _te_layer_metrics(intermediates, required):
+  """Read the real TE counters sown by DeepSeekGenericLayer.post_process."""
+  keys = ("te_moe_capacity_overflow", "te_moe_total_recv_tokens", "te_moe_recv_capacity_per_rank")
+  if not all(key in intermediates for key in keys):
+    if required:
+      raise ValueError("TE MoE layer did not produce receive-capacity intermediates")
+    return {
+        "te_moe_capacity_overflow": jnp.bool_(False),
+        "te_moe_max_total_recv_tokens": jnp.int32(0),
+        "te_moe_recv_capacity_per_rank": jnp.int32(jnp.iinfo(jnp.int32).max),
+    }
+  values = [jnp.concatenate([jnp.ravel(x) for x in jax.tree.leaves(intermediates[key])]) for key in keys]
+  return {
+      "te_moe_capacity_overflow": jnp.any(values[0]),
+      "te_moe_max_total_recv_tokens": jnp.max(values[1]),
+      "te_moe_recv_capacity_per_rank": jnp.min(values[2]),
+  }
+
+
+def _reduce_aux(stacked_aux):
+  """Match normal GA: sum loss metrics, but OR/max/min TE capacity metrics."""
+  reducers = {
+      "te_moe_capacity_overflow": jnp.any,
+      "te_moe_max_total_recv_tokens": jnp.max,
+      "te_moe_recv_capacity_per_rank": jnp.min,
+  }
+  return {key: reducers.get(key, jnp.sum)(value, axis=0) for key, value in stacked_aux.items()}
+
+
+def _make_layer_adapter(layers, config, layer_name, layer_count):
+  """Expose one homogeneous scanned stack as a pure, single-layer function.
 
   The schedule uses a leading layer axis for params/state; _restore_gradients
   restores the original parameter axis afterward. Sharding metadata stays with
@@ -67,16 +117,22 @@ def _make_layer_adapter(layers, config):
   from maxtext.models.llama2 import LlamaDecoderLayer
   from maxtext.utils import maxtext_utils, maxtext_utils_nnx
 
-  if not isinstance(layers, LlamaDecoderLayer):
-    raise TypeError("Expected a scanned LlamaDecoderLayer, not a full model or sequential layer list")
+  if config.decoder_block == DecoderBlockType.DEEPSEEK:
+    from maxtext.models.deepseek import DeepSeekDenseLayer, DeepSeekMoELayer
+
+    layer_class = DeepSeekDenseLayer if layer_name == "dense_layers" else DeepSeekMoELayer
+  else:
+    layer_class = LlamaDecoderLayer
+  if not isinstance(layers, layer_class):
+    raise TypeError(f"Expected a scanned {layer_class.__name__} for {layer_name}")
   graphdef, params, state = nnx.split(layers, nnx.Param, ...)
   if config.param_scan_axis != 0:
     params = jax.tree.map(lambda x: jnp.moveaxis(x, config.param_scan_axis, 0), params)
-  params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, config.num_decoder_layers)
-  state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, config.num_decoder_layers)
+  params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, layer_count)
+  state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, layer_count)
 
   def layer_apply(weights, hidden, layer_state, positions, segments):
-    weights, layer_state = maxtext_utils_nnx.nnx_remove_scan_axis((weights, layer_state), "layers")
+    weights, layer_state = maxtext_utils_nnx.nnx_remove_scan_axis((weights, layer_state), layer_name)
     layer = nnx.merge(graphdef, weights, layer_state, copy=True)
     hidden, _ = layer(
         hidden,
@@ -85,6 +141,9 @@ def _make_layer_adapter(layers, config):
         deterministic=True,
         model_mode=MODEL_MODE_TRAIN,
     )
+    if config.te_moe_block:
+      stats = _te_layer_metrics(nnx.pop(layer, nnx.Intermediate), required=layer_name == "moe_layers")
+      return hidden, stats
     return hidden
 
   if config.remat_policy == "full":
@@ -96,7 +155,7 @@ def _make_layer_adapter(layers, config):
   return layer_apply, params, state
 
 
-def _make_boundaries(model, config, loss_from_logits):
+def _make_boundaries(model, config, loss_from_logits, layer_names=("layers",)):
   """Reuse MaxText's actual embedding/head methods without carrying layer weights.
 
   The copy changes only Python graph structure, not the caller's model. Both
@@ -104,7 +163,8 @@ def _make_boundaries(model, config, loss_from_logits):
   Zero-dropout, unquantized execution does not advance mutable model state.
   """
   boundary_model = nnx.clone(model)
-  del boundary_model.decoder.layers
+  for name in layer_names:
+    delattr(boundary_model.decoder, name)
   graphdef, params, state = nnx.split(boundary_model, nnx.Param, ...)
 
   def prefix_apply(weights, batch):
@@ -151,11 +211,14 @@ def _microbatches(data, count, micro_batch_size):
   return jax.tree.map(reshape, data)
 
 
-def _restore_gradients(layer_grads, boundary_grads, param_scan_axis):
+def _restore_gradients(layer_grads, boundary_grads, param_scan_axis, layer_names=("layers",)):
   """Restore the full model parameter tree and its original layer axis."""
+  groups = layer_grads if isinstance(layer_grads, tuple) else (layer_grads,)
+  if len(groups) != len(layer_names):
+    raise ValueError("Layer gradient groups do not match the decoder stack names")
   if param_scan_axis != 0:
-    layer_grads = jax.tree.map(lambda x: jnp.moveaxis(x, 0, param_scan_axis), layer_grads)
-  return nnx.merge_state(boundary_grads, nnx.State({"decoder": {"layers": layer_grads}}))
+    groups = jax.tree.map(lambda x: jnp.moveaxis(x, 0, param_scan_axis), groups)
+  return nnx.merge_state(boundary_grads, nnx.State({"decoder": dict(zip(layer_names, groups))}))
 
 
 def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logits):
@@ -180,14 +243,20 @@ def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logi
 
   params = jax.tree.map(shard, params, params_shardings)
   nnx.update(local_model, params)
-  layer_apply, layer_params, layer_state = _make_layer_adapter(local_model.decoder.layers, config)
-  prefix_apply, loss_apply, boundary_params = _make_boundaries(local_model, config, loss_from_logits)
+  groups = _layer_groups(config)
+  layer_names = tuple(name for name, _ in groups)
+  adapters = tuple(_make_layer_adapter(getattr(local_model.decoder, name), config, name, count) for name, count in groups)
+  layer_apply, layer_params, layer_state = map(tuple, zip(*adapters))
+  prefix_apply, loss_apply, boundary_params = _make_boundaries(local_model, config, loss_from_logits, layer_names)
   batch = _microbatches(data, config.gradient_accumulation_steps, config.micro_batch_size_to_train_on)
-  schedule = make_training_schedule(prefix_apply, layer_apply, loss_apply, grad_dtype=config.grad_dtype)
+  schedule = make_training_schedule(
+      prefix_apply, layer_apply, loss_apply, grad_dtype=config.grad_dtype,
+      layer_has_aux=config.te_moe_block, reduce_aux=_reduce_aux,
+  )
   with jax.named_scope("dual_pipe"):
     loss_sum, aux, layer_grads, boundary_grads = schedule(layer_params, layer_state, boundary_params, batch)
 
-  raw_grads = _restore_gradients(layer_grads, boundary_grads, config.param_scan_axis)
+  raw_grads = _restore_gradients(layer_grads, boundary_grads, config.param_scan_axis, layer_names)
   if jax.tree.structure(raw_grads) != jax.tree.structure(params):
     raise ValueError("dual_pipe gradient tree does not match the full model parameter tree")
   raw_grads = jax.tree.map(shard, raw_grads, params_shardings)

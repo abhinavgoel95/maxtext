@@ -2193,7 +2193,7 @@ class Optimizer(BaseModel):
   )
   gradient_accumulation_schedule: Literal["serial", "dual_pipe"] = Field(
       "serial",
-      description="Gradient accumulation schedule; dual_pipe enables the experimental dense-Llama fused layer scan.",
+      description="Gradient accumulation schedule; dual_pipe enables experimental fused Llama/DeepSeek layer scans.",
   )
   use_tunix_gradient_accumulation: bool = Field(
       False,

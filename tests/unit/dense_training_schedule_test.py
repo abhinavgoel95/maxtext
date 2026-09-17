@@ -72,6 +72,53 @@ def reference_loss(layer_params, boundary_params, layer_state, data):
   return loss_total, {"total_loss": loss_total, "total_weights": weights_total}
 
 
+def expert_layer_apply(params, hidden, state, positions, segments):
+  """A tiny soft-routed expert layer with a different parameter/residual tree."""
+  del positions, segments
+  expert_hidden = jnp.tanh(jnp.einsum("...d,edh->...eh", hidden, params["up"]))
+  expert_outputs = jnp.einsum("...eh,ehd->...ed", expert_hidden, params["down"])
+  routing = jax.nn.softmax(hidden @ params["router"], axis=-1)
+  return jnp.sum(expert_outputs * routing[..., None], axis=-2) * state["scale"]
+
+
+def make_grouped_inputs(lengths, microbatches):
+  _, _, boundary, data = make_inputs(1, microbatches)
+  functions, params, states = [], [], []
+  for index, length in enumerate(lengths):
+    if index % 2 == 0:
+      weights, state, _, _ = make_inputs(length, microbatches)
+      functions.append(layer_apply)
+    else:
+      keys = jax.random.split(jax.random.key(31 + index), 3)
+      weights = {
+          "up": jax.random.normal(keys[0], (length, 2, 4, 6)) * 0.2,
+          "down": jax.random.normal(keys[1], (length, 2, 6, 4)) * 0.2,
+          "router": jax.random.normal(keys[2], (length, 4, 2)) * 0.2,
+      }
+      state = {"scale": jnp.full((length,), 1.1)}
+      functions.append(expert_layer_apply)
+    params.append(weights)
+    states.append(state)
+  return tuple(functions), (tuple(params), tuple(states), boundary, data)
+
+
+def grouped_reference_loss(functions, params, boundary, states, data):
+  loss_sum, weights_sum = jnp.float32(0), jnp.int32(0)
+  for microbatch in range(data["inputs"].shape[0]):
+    one = jax.tree.map(lambda x: x[microbatch], data)
+    hidden = prefix_apply(boundary, one)
+    for apply, group_params, state in zip(functions, params, states):
+      for layer in range(jax.tree.leaves(group_params)[0].shape[0]):
+        hidden = apply(
+            jax.tree.map(lambda x: x[layer], group_params), hidden,
+            jax.tree.map(lambda x: x[layer], state), one["inputs_position"], one["inputs_segmentation"],
+        )
+    loss, aux = loss_apply(boundary, hidden, one)
+    loss_sum += loss
+    weights_sum += aux["total_weights"]
+  return loss_sum, {"total_loss": loss_sum, "total_weights": weights_sum}
+
+
 class DenseTrainingScheduleTest(unittest.TestCase):
   def assert_tree_allclose(self, actual, expected):
     self.assertEqual(jax.tree.structure(actual), jax.tree.structure(expected))
@@ -136,6 +183,70 @@ class DenseTrainingScheduleTest(unittest.TestCase):
     scopes = [str(eq.source_info.name_stack).split("/") for eq in layer_bodies[0].eqns]
     self.assertTrue(any("backward" in scope for scope in scopes))
     self.assertTrue(any("forward" in scope for scope in scopes))
+
+  def test_heterogeneous_groups_match_full_autodiff(self):
+    for lengths in ((1, 3), (3, 1), (2, 2), (1, 2, 1), (3,)):
+      for microbatches in (1, 2, 3):
+        functions, args = make_grouped_inputs(lengths, microbatches)
+        params, states, boundary, data = args
+        reference = lambda p, b: grouped_reference_loss(functions, p, b, states, data)
+        (loss, aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(params, boundary)
+        for schedule in ("serial", "dual_pipe"):
+          with self.subTest(lengths=lengths, microbatches=microbatches, schedule=schedule):
+            step = make_training_schedule(prefix_apply, functions, loss_apply, schedule)
+            self.assert_tree_allclose(jax.jit(step)(*args), (loss, aux, layer_grads, boundary_grads))
+
+  def test_heterogeneous_segments_keep_backward_forward_together(self):
+    functions, args = make_grouped_inputs((1, 3), 3)
+    graph = jax.make_jaxpr(make_training_schedule(prefix_apply, functions, loss_apply))(*args)
+    steady = [
+        eq for eq in graph.jaxpr.eqns
+        if eq.primitive.name == "scan" and "steady_Bi_Fnext" in str(eq.source_info.name_stack)
+    ]
+    self.assertEqual(len(steady), 1)
+    self.assertEqual(steady[0].params["length"], 2)
+    segments = [eq for eq in steady[0].params["jaxpr"].jaxpr.eqns if eq.primitive.name == "scan"]
+    self.assertEqual([eq.params["length"] for eq in segments], [1, 2, 1])
+    for segment in segments:
+      scopes = [str(eq.source_info.name_stack).split("/") for eq in segment.params["jaxpr"].jaxpr.eqns]
+      self.assertTrue(any("backward" in scope for scope in scopes))
+      self.assertTrue(any("forward" in scope for scope in scopes))
+
+  def test_heterogeneous_full_remat_preserves_aux_and_gradients(self):
+    functions, (params, states, boundary, data) = make_grouped_inputs((1, 3), 3)
+    data["inputs_position"] += jnp.arange(3)[:, None, None] * 10
+    for index, (length, state) in enumerate(zip((1, 3), states)):
+      state["received"] = jnp.arange(length, dtype=jnp.int32) + index
+      state["capacity"] = jnp.full((length,), 15 - index, jnp.int32)
+
+    def with_metrics(apply):
+      def layer(params, hidden, state, positions, segments):
+        received = state["received"] + jnp.max(positions)
+        hidden = apply(params, hidden, state, positions, segments)
+        return hidden, {"overflow": received > state["capacity"], "received": received, "capacity": state["capacity"]}
+      return jax.checkpoint(layer, policy=jax.checkpoint_policies.nothing_saveable)
+
+    def reduce_metrics(aux):
+      reducers = {"overflow": jnp.any, "received": jnp.max, "capacity": jnp.min}
+      return {key: reducers.get(key, jnp.sum)(value, axis=0) for key, value in aux.items()}
+
+    reference = lambda p, b: grouped_reference_loss(functions, p, b, states, data)
+    (loss, expected_aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(params, boundary)
+    expected_aux.update(overflow=jnp.bool_(True), received=jnp.int32(25), capacity=jnp.int32(14))
+    for schedule in ("serial", "dual_pipe"):
+      with self.subTest(schedule=schedule):
+        step = make_training_schedule(
+            prefix_apply, tuple(with_metrics(apply) for apply in functions), loss_apply, schedule,
+            layer_has_aux=True, reduce_aux=reduce_metrics,
+        )
+        actual = jax.jit(step)(params, states, boundary, data)
+        self.assert_tree_allclose(actual, (loss, expected_aux, layer_grads, boundary_grads))
+
+  def test_empty_groups_must_be_omitted(self):
+    functions, args = make_grouped_inputs((0,), 1)
+    step = make_training_schedule(prefix_apply, functions, loss_apply)
+    with self.assertRaisesRegex(ValueError, "omit empty groups"):
+      jax.jit(step)(*args)
 
 
 if __name__ == "__main__":

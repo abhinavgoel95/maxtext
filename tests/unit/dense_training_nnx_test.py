@@ -8,7 +8,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from maxtext.experimental.dense_training_nnx import _make_boundaries, _microbatches, _restore_gradients
+from maxtext.common.common_types import DecoderBlockType, ShardMode
+from maxtext.experimental.dense_training_nnx import (
+    _layer_groups, _make_boundaries, _microbatches, _reduce_aux, _restore_gradients,
+    _te_layer_metrics, validate_training_config,
+)
 from maxtext.experimental.dense_training_schedule import make_training_schedule
 from maxtext.utils.globals import EPS
 
@@ -29,6 +33,20 @@ class TinyLayerStack(nnx.Module):
     self.kernel = nnx.Param(jnp.moveaxis(kernel, 0, scan_axis), out_sharding=tuple(kernel_axes))
     self.bias = nnx.Param(jnp.moveaxis(bias, 0, scan_axis), out_sharding=tuple(bias_axes))
     self.gain = nnx.Variable(jnp.full((layers, 4), 0.9))
+
+
+class TinyExpertStack(nnx.Module):
+  """Different parameter shapes/tree from the dense prefix; no TE kernels."""
+
+  def __init__(self, layers, scan_axis):
+    for name, shape, axes in (
+        ("gate", (layers, 4, 2), ("moe_layers", "embed", "expert")),
+        ("experts", (layers, 2, 4, 4), ("moe_layers", "expert", "embed", "mlp")),
+    ):
+      value = jax.random.normal(jax.random.key(len(shape)), shape) * 0.15
+      axes = list(axes)
+      axes.insert(scan_axis, axes.pop(0))
+      setattr(self, name, nnx.Param(jnp.moveaxis(value, 0, scan_axis), out_sharding=tuple(axes)))
 
 
 class TinyDecoder(nnx.Module):
@@ -69,6 +87,13 @@ def layer_apply(params, hidden, state, positions, segments):
   return jnp.tanh(hidden @ params["kernel"].get_value() + params["bias"].get_value()) * state["gain"].get_value()
 
 
+def expert_apply(params, hidden, state, positions, segments):
+  del state, positions, segments
+  scores = jax.nn.softmax(hidden @ params["gate"].get_value(), axis=-1)
+  outputs = jnp.tanh(jnp.einsum("...d,edh->...eh", hidden, params["experts"].get_value()))
+  return hidden + jnp.sum(outputs * scores[..., None], axis=-2)
+
+
 def make_data(microbatches, empty=False):
   shape = (microbatches * 2, 3)
   indices = jnp.arange(np.prod(shape)).reshape(shape)
@@ -85,9 +110,9 @@ class DenseTrainingNnxTest(unittest.TestCase):
   def setUp(self):
     super().setUp()
     mesh = jax.sharding.Mesh(
-        np.array([jax.devices()[0]]).reshape((1, 1, 1, 1)),
-        ("vocab", "embed", "mlp", "layers"),
-        axis_types=(jax.sharding.AxisType.Auto,) * 4,
+        np.array([jax.devices()[0]]).reshape((1,) * 7),
+        ("vocab", "embed", "mlp", "layers", "expert", "dense_layers", "moe_layers"),
+        axis_types=(jax.sharding.AxisType.Auto,) * 7,
     )
     self.enterContext(jax.set_mesh(mesh))
 
@@ -205,6 +230,91 @@ class DenseTrainingNnxTest(unittest.TestCase):
           updated = jax.tree.map(lambda p, g: p - 0.01 * g, all_params, grads)
           expected_updated = jax.tree.map(lambda p, g: p - 0.01 * g, all_params, reference_grads)
           self.assert_tree_allclose(updated, expected_updated)
+
+  def test_deepseek_group_gradients_restore_full_model_tree(self):
+    for scan_axis in (0, 1):
+      with self.subTest(scan_axis=scan_axis):
+        model = TinyTransformer(layers=1, scan_axis=scan_axis)
+        model.decoder.dense_layers = model.decoder.layers
+        del model.decoder.layers
+        model.decoder.moe_layers = TinyExpertStack(3, scan_axis)
+        names = ("dense_layers", "moe_layers")
+        graphdef, all_params, rest = nnx.split(model, nnx.Param, ...)
+        prefix, head, boundary = _make_boundaries(model, SimpleNamespace(), loss_from_logits, names)
+        self.assertNotIn("dense_layers", boundary["decoder"])
+        self.assertNotIn("moe_layers", boundary["decoder"])
+        group_params, group_states = [], []
+        for name in names:
+          _, params, state = nnx.split(getattr(model.decoder, name), nnx.Param, ...)
+          group_params.append(jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params))
+          group_states.append(state)
+        data = _microbatches(make_data(3), 3, 2)
+
+        def reference(params):
+          total = jnp.float32(0)
+          local_model = nnx.merge(graphdef, params, rest, copy=True)
+          for mb in range(3):
+            batch = jax.tree.map(lambda x: x[mb], data)
+            hidden = local_model.decoder._apply_embedding(
+                local_model.token_embedder, batch["inputs"], batch["inputs_position"],
+                deterministic=True, model_mode="train",
+            )
+            for name, count, apply in zip(names, (1, 3), (layer_apply, expert_apply)):
+              _, weights, state = nnx.split(getattr(local_model.decoder, name), nnx.Param, ...)
+              weights = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), weights)
+              for index in range(count):
+                hidden = apply(jax.tree.map(lambda x: x[index], weights), hidden,
+                               jax.tree.map(lambda x: x[index], state), None, None)
+            logits = local_model.decoder.apply_output_head(
+                local_model.token_embedder, hidden, deterministic=True, model_mode="train"
+            )
+            total += loss_from_logits(logits, batch, None, None)[0]
+          return total
+
+        expected_loss, expected_grads = jax.jit(jax.value_and_grad(reference))(all_params)
+        checkpointed = tuple(jax.checkpoint(f, policy=jax.checkpoint_policies.nothing_saveable)
+                             for f in (layer_apply, expert_apply))
+        schedule = make_training_schedule(prefix, checkpointed, head)
+        loss, _, group_grads, boundary_grads = jax.jit(schedule)(
+            tuple(group_params), tuple(group_states), boundary, data
+        )
+        grads = _restore_gradients(group_grads, boundary_grads, scan_axis, names)
+        np.testing.assert_allclose(loss, expected_loss, rtol=2e-5)
+        self.assert_tree_allclose(grads, expected_grads)
+
+  def test_te_metrics_preserve_overflow_and_capacity(self):
+    layer = nnx.Module()
+    layer.sow(nnx.Intermediate, "te_moe_capacity_overflow", jnp.array([False, True]))
+    layer.sow(nnx.Intermediate, "te_moe_total_recv_tokens", jnp.array([5, 13], jnp.int32))
+    layer.sow(nnx.Intermediate, "te_moe_recv_capacity_per_rank", jnp.int32(12))
+    metrics = _te_layer_metrics(nnx.pop(layer, nnx.Intermediate), required=True)
+    neutral = _te_layer_metrics({}, required=False)
+    reduced = _reduce_aux(jax.tree.map(lambda a, b: jnp.stack([a, b]), neutral, metrics))
+    self.assertTrue(bool(reduced["te_moe_capacity_overflow"]))
+    self.assertEqual(int(reduced["te_moe_max_total_recv_tokens"]), 13)
+    self.assertEqual(int(reduced["te_moe_recv_capacity_per_rank"]), 12)
+    with self.assertRaisesRegex(ValueError, "receive-capacity"):
+      _te_layer_metrics({}, required=True)
+
+  def test_deepseek_validation_and_group_layout(self):
+    config = SimpleNamespace(
+        decoder_block=DecoderBlockType.DEEPSEEK, scan_layers=True, inhomogeneous_layer_cycle_interval=1,
+        num_decoder_layers=4, first_num_dense_layers=1, shard_mode=ShardMode.AUTO,
+        remat_policy="full", dropout_rate=0, quantization="te_no_quant", num_experts=16, mtp_num_layers=0,
+        te_moe_block=True, te_gmm_quantization="te_no_quant", load_balance_loss_weight=0,
+        routed_bias=False, routed_bias_update_rate=0, num_vocab_tiling=1,
+    )
+    validate_training_config(config)
+    self.assertEqual(_layer_groups(config), (("dense_layers", 1), ("moe_layers", 3)))
+    no_dense = SimpleNamespace(**{**vars(config), "first_num_dense_layers": 0})
+    validate_training_config(no_dense)
+    self.assertEqual(_layer_groups(no_dense), (("moe_layers", 4),))
+    for field, value in (("quantization", "te_mxfp8"), ("te_gmm_quantization", "te_mxfp8"),
+                         ("te_moe_block", False), ("load_balance_loss_weight", 0.01),
+                         ("routed_bias", True), ("routed_bias_update_rate", 0.01),
+                         ("first_num_dense_layers", 4)):
+      with self.subTest(field=field), self.assertRaises(ValueError):
+        validate_training_config(SimpleNamespace(**{**vars(config), field: value}))
 
 
 if __name__ == "__main__":
