@@ -15,7 +15,7 @@ from maxtext.utils.globals import EPS
 
 
 def validate_training_config(config):
-  """Keep the initial comparison deterministic and free of mutable quantization."""
+  """Require deterministic layers and stateless TE quantization recipes."""
   is_deepseek = config.decoder_block == DecoderBlockType.DEEPSEEK
   if config.decoder_block not in (DecoderBlockType.LLAMA2, DecoderBlockType.DEEPSEEK):
     raise ValueError("dual_pipe currently supports decoder_block=llama2 or deepseek")
@@ -29,21 +29,28 @@ def validate_training_config(config):
     raise ValueError("dual_pipe requires remat_policy=none or remat_policy=full")
   if config.dropout_rate != 0:
     raise ValueError("dual_pipe requires dropout_rate=0; layer state is read-only")
-  if config.quantization not in ("", "te_no_quant") or config.mtp_num_layers != 0:
-    raise ValueError("dual_pipe requires quantization='' or te_no_quant, and mtp_num_layers=0")
+  if config.mtp_num_layers != 0:
+    raise ValueError("dual_pipe requires mtp_num_layers=0")
   if is_deepseek:
     if not 0 <= config.first_num_dense_layers < config.num_decoder_layers:
       raise ValueError("DeepSeek dual_pipe requires at least one MoE layer and a valid dense prefix")
     if config.num_experts <= 1 or not config.te_moe_block:
       raise ValueError("DeepSeek dual_pipe currently requires num_experts>1 and te_moe_block=true")
-    if config.quantization != "te_no_quant" or config.te_gmm_quantization != "te_no_quant":
-      raise ValueError("DeepSeek dual_pipe requires quantization=te_no_quant and te_gmm_quantization=te_no_quant")
+    # Current scaling and MXFP8 derive scales from each invocation's tensors;
+    # unlike delayed scaling, neither needs persistent amax-history updates.
+    if config.quantization not in ("te_no_quant", "te_fp8_currentscaling"):
+      raise ValueError("DeepSeek dual_pipe requires quantization=te_no_quant or te_fp8_currentscaling")
+    if config.te_gmm_quantization not in ("te_no_quant", "te_mxfp8"):
+      raise ValueError("DeepSeek dual_pipe requires te_gmm_quantization=te_no_quant or te_mxfp8")
     # DeepSeek's frozen MoEBiasVar is already carried as read-only layer state.
     # Bias updates and auxiliary load-balancing loss are not implemented here.
     if config.load_balance_loss_weight != 0 or config.routed_bias_update_rate != 0:
       raise ValueError("DeepSeek dual_pipe requires load_balance_loss_weight=0 and routed_bias_update_rate=0 (frozen bias)")
-  elif config.num_experts != 1 or getattr(config, "te_moe_block", False):
-    raise ValueError("Llama dual_pipe currently supports dense layers only")
+  else:
+    if config.quantization not in ("", "te_no_quant"):
+      raise ValueError("Llama dual_pipe requires quantization='' or te_no_quant")
+    if config.num_experts != 1 or getattr(config, "te_moe_block", False):
+      raise ValueError("Llama dual_pipe currently supports dense layers only")
   if getattr(config, "training_objective", "causal_lm") != "causal_lm":
     raise ValueError("dual_pipe currently supports training_objective=causal_lm only")
   if getattr(config, "attention_type", "global") == "block_diffusion":
@@ -164,7 +171,7 @@ def _make_boundaries(model, config, loss_from_logits, layer_names=("layers",)):
 
   The copy changes only Python graph structure, not the caller's model. Both
   boundaries share the same parameter tree, so tied embedding gradients add.
-  Zero-dropout, unquantized execution does not advance mutable model state.
+  Zero dropout and the allowed stateless recipes do not advance mutable state.
   """
   boundary_model = nnx.clone(model)
   for name in layer_names:

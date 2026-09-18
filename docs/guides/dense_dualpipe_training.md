@@ -37,9 +37,11 @@ There is no separate benchmark entry point.
   a TE-MoE stack, as described below.
 - `scan_layers=true`, homogeneous layers within each stack, and `shard_mode=auto`.
 - `remat_policy=none` or `full`; `full` uses `nothing_saveable`.
-- `dropout_rate=0`, no quantized weights/activations. The current TE-MoE adapter
-  requires `quantization=te_no_quant` and `te_gmm_quantization=te_no_quant`.
-  The test scripts below explicitly set both modes to `te_no_quant`.
+- `dropout_rate=0`, with model parameters stored in FP32/BF16/FP16.
+  Llama remains unquantized. DeepSeek allows `quantization=te_no_quant` or
+  `te_fp8_currentscaling`, and `te_gmm_quantization=te_no_quant` or `te_mxfp8`.
+  These recipes derive scales per invocation; no persistent quantizer state
+  is carried or updated by the adapter. Delayed scaling and NVFP4 remain excluded.
 - DeepSeek router bias may be enabled with `routed_bias_update_rate=0` and
   `load_balance_loss_weight=0`; it remains read-only, non-parameter layer state.
 - `num_vocab_tiling=1`, ordinary causal-LM loss, no mutable internal metrics.
@@ -113,9 +115,11 @@ bash scripts/experimental/run_deepseek_small_dualpipe.sh --dry-run
 ```
 
 Inspect the generated scripts first. Remove `--dry-run` to submit a test.
-Both test configurations pass the adapter's feature checks. The dual-pipe
-configuration completed a 15-step GPU smoke test; numerical equivalence and
-performance against serial remain to be established.
+Both test configurations pass the adapter's feature checks. On 2026-09-18,
+combined FP8-current-scaling/MXFP8 serial and dual-pipe runs completed 15 steps
+with the `maxtext-2026-09-11` container. PGLE was enabled only for the dual-pipe
+run; these smoke tests do not establish numerical equivalence or an isolated
+schedule performance comparison.
 Other launcher options can be appended unchanged, for example
 `--profiler nsys` or `--container IMAGE`. Both scripts now pass `--no-pgle`
 for the runtime-crash investigation; XPlane remains the default profiler.
@@ -131,8 +135,10 @@ relative to the regular preset are:
 - Sixteen routed experts: `num_experts=16`.
 - GA=3 and the selected accumulation schedule.
 - Full rematerialization (`remat_policy=full`) instead of the preset's custom policy.
-- No quantization: `quantization=te_no_quant` and `te_gmm_quantization=te_no_quant`
-  explicitly override the preset's FP8 modes in both tests.
+- Explicit quantization selection: `quantization=te_fp8_currentscaling` for
+  supported dense TE GEMMs and `te_gmm_quantization=te_mxfp8` for expert GEMMs.
+  This matches the regular preset's precision modes without changing parameter
+  or optimizer storage dtypes.
 - `override_model_config=true` so the three model-size overrides take effect.
 - PGLE disabled (`--no-pgle`) to isolate the serial-run illegal memory access.
 
@@ -146,6 +152,13 @@ NCCL settings, and `JAX_ENABLE_X64=0` are also inherited unchanged.
 The global microbatch is 24 and the accumulated batch is 72 with GA=3.
 The preset's per-activation remat/offload settings are not edited, but selecting
 `remat_policy=full` replaces its custom remat/offload policy.
+
+To return either script to the unquantized baseline, append
+`--maxtext-arg quantization=te_no_quant --maxtext-arg te_gmm_quantization=te_no_quant`.
+Use the canonical recipe strings above: `mxfp8` and `te_fp8_current_scaling` are
+not valid MaxText values. No TE kernels or scheduling logic are changed by the
+recipe selection; full remat also recomputes any needed quantization and amax
+reductions inside backward.
 
 The launcher currently prints the preset's GA=1 in its summary even though the
 emitted Python command correctly contains `gradient_accumulation_steps=3`.
@@ -171,9 +184,10 @@ work inside backward is distinct from the next-microbatch forward branch.
 The adapter allows the inherited `routed_bias=true` with its update rate at zero.
 The existing per-layer state path carries the bias without parameter gradients
 or optimizer updates. Nonzero bias updates, auxiliary load-balancing loss, and
-FP8 remain unsupported. No routing settings or kernels were changed to allow
-frozen bias. A one-node GPU run on 2026-09-17 completed all 15 steps with these
-dual-pipe settings. Its optimized HLO contains next-forward EP combine windows
+stateful quantization recipes remain unsupported. No routing settings or kernels
+were changed to allow frozen bias. A one-node GPU run on 2026-09-17 completed all
+15 steps with both quantization settings at `te_no_quant`. Its optimized HLO
+contains next-forward EP combine windows
 spanning backward grouped GEMMs, and backward EP combine windows spanning
 next-forward dense GEMMs. This establishes execution and scheduling structure,
 not numerical equivalence to serial or measured GPU overlap. Some dispatch

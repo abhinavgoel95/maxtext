@@ -1,5 +1,7 @@
 """Tiny NNX integration tests without loading the full MaxText model stack."""
 
+from enum import Enum
+from itertools import product
 import sys
 import unittest
 from types import SimpleNamespace
@@ -143,6 +145,17 @@ def make_data(microbatches, empty=False):
       "targets": (indices + 2) % 7,
       "targets_segmentation": jnp.zeros(shape, jnp.int32) if empty else (indices % 3 != 0).astype(jnp.int32),
   }
+
+
+def deepseek_config(**overrides):
+  values = dict(
+      decoder_block=DecoderBlockType.DEEPSEEK, scan_layers=True, inhomogeneous_layer_cycle_interval=1,
+      num_decoder_layers=4, first_num_dense_layers=1, shard_mode=ShardMode.AUTO,
+      remat_policy="full", dropout_rate=0, quantization="te_no_quant", num_experts=16, mtp_num_layers=0,
+      te_moe_block=True, te_gmm_quantization="te_no_quant", load_balance_loss_weight=0,
+      routed_bias=False, routed_bias_update_rate=0, num_vocab_tiling=1,
+  )
+  return SimpleNamespace(**{**values, **overrides})
 
 
 class DenseTrainingNnxTest(unittest.TestCase):
@@ -348,8 +361,9 @@ class DenseTrainingNnxTest(unittest.TestCase):
             DeepSeekDenseLayer=TinyFrozenExpertLayer, DeepSeekMoELayer=TinyFrozenExpertLayer),
     }
     bias_values = jnp.array([[0.5, -0.2, -0.3], [-0.2, 0.5, -0.3], [-0.3, -0.2, 0.5]])
-    for scan_axis in (0, 1):
-      with self.subTest(scan_axis=scan_axis):
+    recipes = (("te_no_quant", "te_no_quant"), ("te_fp8_currentscaling", "te_mxfp8"))
+    for scan_axis, (quantization, te_gmm_quantization) in product((0, 1), recipes):
+      with self.subTest(scan_axis=scan_axis, quantization=quantization, te_gmm_quantization=te_gmm_quantization):
         model = TinyTransformer()
         del model.decoder.layers
         stack = nnx_scan.create_scanned_layers(
@@ -364,8 +378,13 @@ class DenseTrainingNnxTest(unittest.TestCase):
         original_state = nnx.state(model, nnx.Not(nnx.Param))
         all_params = nnx.state(model, nnx.Param)
         self.assertNotIn("bias", all_params["decoder"]["moe_layers"]["gate"])
-        config = SimpleNamespace(decoder_block=DecoderBlockType.DEEPSEEK, param_scan_axis=scan_axis,
-                                 remat_policy="full", te_moe_block=True)
+        # Accepted recipes must not change the adapter's frozen-state handling.
+        # The tiny layer does not emulate or validate TE quantization kernels.
+        config = deepseek_config(
+            param_scan_axis=scan_axis, num_decoder_layers=3, first_num_dense_layers=0,
+            routed_bias=True, quantization=quantization, te_gmm_quantization=te_gmm_quantization,
+        )
+        validate_training_config(config)
         with mock.patch.dict(sys.modules, model_modules), mock.patch.multiple(
             "maxtext.utils", create=True, maxtext_utils_nnx=maxtext_utils_nnx,
             maxtext_utils=SimpleNamespace(should_prevent_cse_in_remat=lambda _: False),
@@ -411,13 +430,7 @@ class DenseTrainingNnxTest(unittest.TestCase):
             self.assert_tree_allclose(nnx.state(updated_model, nnx.Not(nnx.Param)), original_state)
 
   def test_deepseek_validation_and_group_layout(self):
-    config = SimpleNamespace(
-        decoder_block=DecoderBlockType.DEEPSEEK, scan_layers=True, inhomogeneous_layer_cycle_interval=1,
-        num_decoder_layers=4, first_num_dense_layers=1, shard_mode=ShardMode.AUTO,
-        remat_policy="full", dropout_rate=0, quantization="te_no_quant", num_experts=16, mtp_num_layers=0,
-        te_moe_block=True, te_gmm_quantization="te_no_quant", load_balance_loss_weight=0,
-        routed_bias=False, routed_bias_update_rate=0, num_vocab_tiling=1,
-    )
+    config = deepseek_config()
     validate_training_config(config)
     frozen_bias = SimpleNamespace(**{**vars(config), "routed_bias": True})
     validate_training_config(frozen_bias)
@@ -425,8 +438,7 @@ class DenseTrainingNnxTest(unittest.TestCase):
     no_dense = SimpleNamespace(**{**vars(config), "first_num_dense_layers": 0})
     validate_training_config(no_dense)
     self.assertEqual(_layer_groups(no_dense), (("moe_layers", 4),))
-    for field, value in (("quantization", "te_mxfp8"), ("te_gmm_quantization", "te_mxfp8"),
-                         ("te_moe_block", False), ("load_balance_loss_weight", 0.01),
+    for field, value in (("te_moe_block", False), ("load_balance_loss_weight", 0.01),
                          ("routed_bias_update_rate", 0.01),
                          ("first_num_dense_layers", 4)):
       with self.subTest(field=field), self.assertRaises(ValueError):
@@ -435,6 +447,45 @@ class DenseTrainingNnxTest(unittest.TestCase):
                                "num_experts": 1, "te_moe_block": False, "routed_bias": True})
     with self.assertRaisesRegex(ValueError, "routed_bias"):
       validate_training_config(llama)
+
+  def test_deepseek_quantization_allowlists_accept_strings_and_string_enums(self):
+    # Match the config enums' str/Enum behavior without heavy config imports.
+    class Recipe(str, Enum):
+      NO_QUANT = "te_no_quant"
+      CURRENT = "te_fp8_currentscaling"
+      MX = "te_mxfp8"
+
+    for dense, gmm, use_enum in product(
+        ("te_no_quant", "te_fp8_currentscaling"), ("te_no_quant", "te_mxfp8"), (False, True)
+    ):
+      with self.subTest(dense=dense, gmm=gmm, use_enum=use_enum):
+        validate_training_config(deepseek_config(
+            routed_bias=True,
+            quantization=Recipe(dense) if use_enum else dense,
+            te_gmm_quantization=Recipe(gmm) if use_enum else gmm,
+        ))
+
+  def test_quantization_allowlists_reject_unrequested_recipes(self):
+    for field, unsupported in (
+        ("quantization", ("", "mxfp8", "te_fp8_current_scaling", "te_mxfp8",
+                          "te_fp8_delayedscaling", "te_nvfp4", "te_nvfp4_no_rht")),
+        ("te_gmm_quantization", ("", "mxfp8", "te_fp8_current_scaling", "te_fp8_currentscaling",
+                                 "te_fp8_delayedscaling", "te_nvfp4", "te_nvfp4_no_rht")),
+    ):
+      for value in unsupported:
+        with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "quantization"):
+          config = deepseek_config(quantization="te_fp8_currentscaling", te_gmm_quantization="te_mxfp8")
+          setattr(config, field, value)
+          validate_training_config(config)
+    for recipe in ("", "te_no_quant", "te_fp8_currentscaling", "te_mxfp8", "te_fp8_delayedscaling", "te_nvfp4"):
+      with self.subTest(llama_quantization=recipe):
+        config = deepseek_config(decoder_block=DecoderBlockType.LLAMA2, num_experts=1,
+                                 te_moe_block=False, quantization=recipe)
+        if recipe in ("", "te_no_quant"):
+          validate_training_config(config)
+        else:
+          with self.assertRaisesRegex(ValueError, "quantization"):
+            validate_training_config(config)
 
 
 if __name__ == "__main__":
