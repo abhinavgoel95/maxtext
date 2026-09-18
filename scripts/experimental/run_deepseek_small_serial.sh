@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Keep the regular DeepSeek preset with test size, topology, GA, schedule, and full remat.
 # Explicitly select FP8 current scaling for dense GEMMs and MXFP8 for expert GEMMs.
-# Disable PGLE for the current runtime-crash investigation.
+# Keep PGLE disabled for a matched schedule comparison.
 # Add --dry-run to inspect generated files without submitting a SLURM job.
 set -euo pipefail
 
-LAUNCHER_DIR="${LAUNCHER_DIR:-/lustre/fsw/coreai_dlcompiler_ci/abgoel/jax_maxtext/maxtext-launcher}"
+: "${LAUNCHER_DIR:?Set LAUNCHER_DIR to your maxtext-launcher checkout}"
+: "${CLUSTER:?Set CLUSTER to a cluster configured in your launcher}"
 MAXTEXT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 exec python3 "${LAUNCHER_DIR}/launcher.py" deepseek-v3-671b \
-  --cluster lyris --nodes 1 --ntasks-per-node 4 --sbatch-segment 0 \
+  --cluster "${CLUSTER}" --nodes 1 --ntasks-per-node 4 \
   --code-dir "${MAXTEXT_DIR}" \
   --no-pgle \
   --ici-dp 1 --ici-fsdp 2 --ici-tp 1 --ici-expert 2 \

@@ -53,14 +53,20 @@ forward operations during backward; those are distinct from the next forward
 branch. Old and new residuals can coexist in the combined loop, so peak memory
 is not guaranteed to be one microbatch's saved activations.
 
-## One-node Llama 3 8B with maxtext-launcher on Lyris
+## One-node Llama 3 8B with maxtext-launcher
 
-From `/lustre/fsw/coreai_dlcompiler_ci/abgoel/jax_maxtext/maxtext-launcher`:
+Set the paths and cluster identifier for your deployment. Keep site-specific
+paths, accounts, partitions, and container settings in your private launcher
+configuration, not in this repository.
 
 ```bash
-python3 launcher.py llama3-8b \
-  --cluster lyris --nodes 1 \
-  --code-dir /lustre/fsw/coreai_dlcompiler_ci/abgoel/jax_maxtext/maxtext \
+export LAUNCHER_DIR=/path/to/maxtext-launcher
+export MAXTEXT_DIR=/path/to/maxtext
+export CLUSTER=your-cluster
+
+python3 "${LAUNCHER_DIR}/launcher.py" llama3-8b \
+  --cluster "${CLUSTER}" --nodes 1 \
+  --code-dir "${MAXTEXT_DIR}" \
   --maxtext-arg gradient_accumulation_schedule=dual_pipe \
   --maxtext-arg gradient_accumulation_steps=3 \
   --maxtext-arg scan_layers=true \
@@ -71,22 +77,19 @@ python3 launcher.py llama3-8b \
 
 Inspect the generated scripts, then rerun without `--dry-run` to submit. Leave
 their Python entry point as `maxtext.trainers.pre_train.train`. No generated
-script editing is needed. `code_dir` mounts the host working tree at
-`/opt/maxtext`; alternatively put the same path in the launcher's personal YAML:
+script editing is needed. Configure the host checkout and container mount in
+your private launcher YAML, for example:
 
 ```yaml
-code_dir: "/lustre/fsw/coreai_dlcompiler_ci/abgoel/jax_maxtext/maxtext"
-code_mount: "/opt/maxtext"
-maxtext_path: "/opt/maxtext"
+code_dir: "/path/to/maxtext"
+code_mount: "/workspace/maxtext"
+maxtext_path: "/workspace/maxtext"
 ```
 
 The command leaves batch size, sequence length, PGLE, command buffers, and
-profiling at the launcher's configured values. The tested Llama preset uses
-four GPUs, 32 layers, sequence length 8192, and per-device batch size 2:
-global microbatch size 8 and accumulated batch size 24 with GA=3.
-The launcher's Llama preset uses `minimal_with_context`, which must be overridden
-to `full` or `none` for this path. Its default 21 steps cover the XPlane capture
-window (skip 10, capture 3).
+profiling at the launcher's configured values. Inspect the resolved preset and
+ensure that the number of training steps covers your profiling window. This
+adapter requires `remat_policy=full` or `none`, regardless of the preset default.
 
 For comparison, change the schedule to `serial` and use a different tag. Keep
 all other options identical. Normal launcher profiling/HLO paths apply to both
@@ -96,36 +99,33 @@ communication, not TE-MoE dispatch/combine A2As.
 
 The container must support the mounted MaxText checkout and provide
 `jax.fwd_and_bwd`. Focused CPU tests cover true-loss gradients, NNX bookkeeping,
-loss masking, and scan structure. The pre-cleanup implementation completed a
-21-step four-GPU Llama 3 8B run; its optimized HLO showed both B/F interleaving
-and asynchronous collective windows. That is not a numerical equivalence test
-or proof of GPU overlap. The training path does not add runtime numerical
-comparisons or NaN/Inf assertions.
+loss masking, and scan structure. HLO interleaving and asynchronous collective
+windows are not proof of measured GPU overlap or numerical equivalence. The
+training path does not add runtime numerical comparisons or NaN/Inf assertions.
 
 ## One-node reduced-layer DeepSeek V3 with TE-MoE
 
 Two matched scripts inherit the regular `deepseek-v3-671b` launcher preset and
 use the normal training entry point, without creating another model config.
-The reference is `ds-v3-JAX_ENABLE_X64-0-correctefd_20260917_092949`.
+Use the same private launcher configuration for both runs.
 
 ```bash
-cd /lustre/fsw/coreai_dlcompiler_ci/abgoel/jax_maxtext/maxtext
+export LAUNCHER_DIR=/path/to/maxtext-launcher
+export CLUSTER=your-cluster
+cd /path/to/maxtext
 bash scripts/experimental/run_deepseek_small_serial.sh --dry-run
 bash scripts/experimental/run_deepseek_small_dualpipe.sh --dry-run
 ```
 
 Inspect the generated scripts first. Remove `--dry-run` to submit a test.
-Both test configurations pass the adapter's feature checks. On 2026-09-18,
-combined FP8-current-scaling/MXFP8 serial and dual-pipe runs completed 15 steps
-with the `maxtext-2026-09-11` container. PGLE was enabled only for the dual-pipe
-run; these smoke tests do not establish numerical equivalence or an isolated
-schedule performance comparison.
+Use a compatible JAX/Transformer Engine environment. Successful execution alone
+does not establish numerical equivalence or a schedule performance improvement.
 Other launcher options can be appended unchanged, for example
-`--profiler nsys` or `--container IMAGE`. Both scripts now pass `--no-pgle`
-for the runtime-crash investigation; XPlane remains the default profiler.
-The only environment override provided
-by these scripts is `LAUNCHER_DIR`, if the launcher is installed elsewhere.
-The MaxText code mount is derived from the script's own checkout.
+`--profiler nsys` or `--container IMAGE`. Both scripts pass `--no-pgle` for a
+matched comparison; profiling otherwise follows your launcher configuration.
+The scripts require `LAUNCHER_DIR` and `CLUSTER`. The MaxText code mount is
+derived from the script's own checkout. Allocation details come from your
+private launcher configuration.
 
 The commands differ only in the schedule and tag. Their only training overrides
 relative to the regular preset are:
@@ -137,21 +137,15 @@ relative to the regular preset are:
 - Full rematerialization (`remat_policy=full`) instead of the preset's custom policy.
 - Explicit quantization selection: `quantization=te_fp8_currentscaling` for
   supported dense TE GEMMs and `te_gmm_quantization=te_mxfp8` for expert GEMMs.
-  This matches the regular preset's precision modes without changing parameter
-  or optimizer storage dtypes.
+  This does not change parameter or optimizer storage dtypes.
 - `override_model_config=true` so the three model-size overrides take effect.
-- PGLE disabled (`--no-pgle`) to isolate the serial-run illegal memory access.
+- PGLE disabled (`--no-pgle`) in both scripts.
 
-Everything else comes from the regular preset and DeepSeek model configuration:
-top-8 routing, embedding width 7168, dense/expert MLP widths 18432/2048,
-128 query/KV heads, Q/KV LoRA ranks 1536/512, sequence length 4096,
-per-device batch size 6, BF16 weights and `mu_dtype`,
-router bias, `capacity_factor=1.0`,
-`ragged_buffer_factor=2.0`, and 15 steps. XPlane, command buffers,
-NCCL settings, and `JAX_ENABLE_X64=0` are also inherited unchanged.
-The global microbatch is 24 and the accumulated batch is 72 with GA=3.
-The preset's per-activation remat/offload settings are not edited, but selecting
-`remat_policy=full` replaces its custom remat/offload policy.
+Everything else comes from your launcher preset and DeepSeek model configuration.
+Check the resolved dtype, routing, batch size, sequence length, capacity, and
+profiling settings before submitting; they must satisfy the supported scope
+above. The preset's per-activation remat/offload settings are not edited, but
+selecting `remat_policy=full` replaces its custom remat/offload policy.
 
 To return either script to the unquantized baseline, append
 `--maxtext-arg quantization=te_no_quant --maxtext-arg te_gmm_quantization=te_no_quant`.
@@ -159,11 +153,6 @@ Use the canonical recipe strings above: `mxfp8` and `te_fp8_current_scaling` are
 not valid MaxText values. No TE kernels or scheduling logic are changed by the
 recipe selection; full remat also recomputes any needed quantization and amax
 reductions inside backward.
-
-The launcher currently prints the preset's GA=1 in its summary even though the
-emitted Python command correctly contains `gradient_accumulation_steps=3`.
-Cluster queue/account/time settings remain those of the current launcher config;
-the saved reference used `gb300`, while current Lyris defaults may select `gb200`.
 
 The combined decoder body pairs old/new logical layers as follows:
 
@@ -185,13 +174,10 @@ The adapter allows the inherited `routed_bias=true` with its update rate at zero
 The existing per-layer state path carries the bias without parameter gradients
 or optimizer updates. Nonzero bias updates, auxiliary load-balancing loss, and
 stateful quantization recipes remain unsupported. No routing settings or kernels
-were changed to allow frozen bias. A one-node GPU run on 2026-09-17 completed all
-15 steps with both quantization settings at `te_no_quant`. Its optimized HLO
-contains next-forward EP combine windows
-spanning backward grouped GEMMs, and backward EP combine windows spanning
-next-forward dense GEMMs. This establishes execution and scheduling structure,
-not numerical equivalence to serial or measured GPU overlap. Some dispatch
-start/done pairs remain adjacent.
+were changed to allow frozen bias. When inspecting the optimized HLO, look for
+next-forward EP combine windows spanning backward grouped GEMMs, and backward
+EP combine windows spanning next-forward dense GEMMs. Confirm actual overlap
+with a GPU trace; some dispatch start/done pairs may remain adjacent.
 
 Use a compatible container and four one-GPU processes; normal MaxText setup
 performs EP bootstrap. CPU tests cannot validate TE communication,
