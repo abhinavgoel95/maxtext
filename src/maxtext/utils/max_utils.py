@@ -1307,7 +1307,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
 
   loaded_batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
   ga_steps = config.gradient_accumulation_steps
-  if loaded_batch_size % ga_steps != 0:
+  if ga_steps < 1 or loaded_batch_size % ga_steps != 0:
     raise ValueError(f"TE MoE EP loaded batch size ({loaded_batch_size}) must be divisible by GA steps ({ga_steps}).")
   # Bootstrap for one model invocation, not the full accumulated batch.
   # Cover both the loaded microbatch and the model-initialization batch.
