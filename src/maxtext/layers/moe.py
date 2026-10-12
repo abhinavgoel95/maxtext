@@ -76,6 +76,21 @@ WI_0 = "wi_0"
 WI_1 = "wi_1"
 WO = "wo"
 
+_TE_MOE_CHECKPOINT_NAMES = {
+    "wi_0_checkpoint_name": "moe_mlpwi_0",
+    "wi_1_checkpoint_name": "moe_mlpwi_1",
+    "wo_checkpoint_name": "moe_mlpwo",
+    "dispatch_checkpoint_name": "moe_dispatch",
+}
+
+
+def _get_te_moe_checkpoint_kwargs(moe_fn, dispatch_policy="remat") -> dict[str, str]:
+  """Pass supported TE checkpoint names; reject unsupported dispatch saving."""
+  parameters = inspect.signature(moe_fn).parameters
+  if dispatch_policy != "remat" and "dispatch_checkpoint_name" not in parameters:
+    raise ValueError("moe_dispatch=device/offload requires TE MoE dispatch_checkpoint_name support.")
+  return {name: label for name, label in _TE_MOE_CHECKPOINT_NAMES.items() if name in parameters}
+
 
 @struct.dataclass
 class RouteMetadata:
@@ -933,7 +948,12 @@ class RoutedMoE(nnx.Module):
         self.config.emb_dim if self.config.moe_expert_input_dim <= 0 else self.config.moe_expert_input_dim
     )
 
-    if self.config.shard_exp_on_fsdp:
+    if self.config.shard_exp_on_fsdp and self.config.te_moe_block:
+      # Keep expert matrices intact; TE gathers FSDP shards at the FFN boundary.
+      # Axis order must be EP, then FSDP.
+      self.wi_kernel_axes = ("expert_weight_fsdp", None, "mlp_moe")
+      self.wo_kernel_axes = ("expert_weight_fsdp", "mlp_moe", None)
+    elif self.config.shard_exp_on_fsdp:
       # special sharding for dsv3
       self.wi_kernel_axes = ("embed_moe", None, "mlp_moe")
       self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
@@ -4783,6 +4803,10 @@ class RoutedMoE(nnx.Module):
 
     fsdp_size = self.mesh.shape.get("fsdp", 1)
     ep_size = self.mesh.shape.get(self._expert_parallelism_name, 1)
+    if self.config.shard_exp_on_fsdp and self._expert_parallelism_name != "expert":
+      raise ValueError("TE expert FSDP sharding currently requires the standard expert mesh axis.")
+    if self.config.shard_exp_on_fsdp and self.num_experts % (ep_size * fsdp_size) != 0:
+      raise ValueError(f"num_experts={self.num_experts} must be divisible by EP x FSDP={ep_size * fsdp_size}.")
     if self.num_experts % ep_size != 0:
       raise ValueError(f"num_experts={self.num_experts} must be divisible by EP size={ep_size}.")
 
@@ -4795,6 +4819,7 @@ class RoutedMoE(nnx.Module):
         n_expert_groups=self.num_experts,
     )
 
+    checkpoint_kwargs = _get_te_moe_checkpoint_kwargs(te_moe.moe, self.config.moe_dispatch)
     output, lb_loss, total_recv_tokens = te_moe.moe(
         inputs,
         gate_kernel,
@@ -4823,6 +4848,8 @@ class RoutedMoE(nnx.Module):
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
+        use_cudnn_fusion=False,
+        **checkpoint_kwargs,
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)

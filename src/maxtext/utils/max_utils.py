@@ -1328,6 +1328,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
       num_experts_per_tok=config.num_experts_per_tok,
       max_tokens_per_rank=max_tokens_per_rank,
       ep_size=ep_size,
+      use_cudnn_fusion=False,
   )
   recv_capacity_factor = None if config.ragged_buffer_factor <= 0 else config.ragged_buffer_factor
   recv_capacity_per_rank = get_moe_recv_capacity_per_rank(
@@ -1336,6 +1337,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
       max_tokens_per_rank=max_tokens_per_rank,
       ep_size=ep_size,
       recv_capacity_factor=recv_capacity_factor,
+      use_cudnn_fusion=False,
   )
   drop_on_overflow = recv_capacity_per_rank < worst_case_recv_capacity_per_rank
   hidden_dim = config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim

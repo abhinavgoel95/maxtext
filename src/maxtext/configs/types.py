@@ -1777,6 +1777,7 @@ DEFAULT_LOGICAL_AXIS_RULES: list[list] = [
     ["activation_exp", ["expert"]],
     # MoE Weights
     ["exp", "expert"],
+    ["expert_weight_fsdp", ["expert", "fsdp"]],
     ["mlp_moe", ["fsdp_transpose", "tensor", "tensor_sequence", "autoregressive"]],
     ["embed_moe", ["fsdp", "fsdp_transpose", "context", "context_usp_ulysses"]],
     ["embed_moe", ["fsdp", "context", "context_usp_ulysses"]],
@@ -2066,6 +2067,11 @@ class RematAndOffload(BaseModel):
   moe_mlpwo: RematLocation = Field(
       RematLocation.REMAT,
       description="Remat policy for the second MoE layer's output.",
+  )
+  moe_dispatch: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Custom remat policy for TE MoE dispatch outputs. Requires TE dispatch_checkpoint_name "
+      "support and scan-safe EP handle reconstruction.",
   )
   query_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the query projection.")
   key_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the key projection.")
@@ -4847,6 +4853,7 @@ class MaxTextConfig(
           "moe_tc_routing_checkpoint",
           "moe_mlpwi_1",
           "moe_mlpwo",
+          "moe_dispatch",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",
@@ -6393,6 +6400,7 @@ class RLConfig(
           "moe_tc_routing_checkpoint",
           "moe_mlpwi_1",
           "moe_mlpwo",
+          "moe_dispatch",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",
