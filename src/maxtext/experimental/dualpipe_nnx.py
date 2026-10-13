@@ -25,8 +25,8 @@ def validate_training_config(config):
     raise ValueError("At least one decoder layer is required")
   if config.shard_mode != ShardMode.AUTO:
     raise ValueError("dual_pipe currently requires shard_mode=auto")
-  if config.remat_policy not in ("none", "full"):
-    raise ValueError("dual_pipe requires remat_policy=none or remat_policy=full")
+  if config.remat_policy not in ("none", "full", "save_qkv_proj", "custom"):
+    raise ValueError("dual_pipe supports remat_policy=none, full, save_qkv_proj, or custom")
   if config.dropout_rate != 0:
     raise ValueError("dual_pipe requires dropout_rate=0; layer state is read-only")
   if config.mtp_num_layers != 0:
@@ -107,7 +107,7 @@ def _te_layer_metrics(intermediates, required):
   }
 
 
-def _make_layer_adapter(layers, config, layer_name, layer_count):
+def _make_layer_adapter(layers, config, layer_name, layer_count, checkpoint_policy=None):
   """Expose one homogeneous scanned stack as a pure, single-layer function.
 
   The schedule uses a leading layer axis for params/state; _restore_gradients
@@ -149,10 +149,18 @@ def _make_layer_adapter(layers, config, layer_name, layer_count):
       stats = _te_layer_metrics(nnx.pop(layer, nnx.Intermediate), required=layer_name == "moe_layers")
     return hidden, stats
 
-  if config.remat_policy == "full":
+  if config.remat_policy != "none":
+    # Reuse MaxText's policy for saved/offloaded activations. Full remat keeps
+    # its existing input-only backward path; custom policies use saved VJP
+    # values, which may still include weights (not activation-only storage).
+    policy = (
+        jax.checkpoint_policies.nothing_saveable
+        if config.remat_policy == "full"
+        else checkpoint_policy
+    )
     layer_apply = jax.checkpoint(
         layer_apply,
-        policy=jax.checkpoint_policies.nothing_saveable,
+        policy=policy,
         prevent_cse=maxtext_utils.should_prevent_cse_in_remat(config),
     )
   return layer_apply, params, state
@@ -248,7 +256,15 @@ def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logi
   nnx.update(local_model, params)
   groups = _layer_groups(config)
   layer_names = tuple(name for name, _ in groups)
-  adapters = tuple(_make_layer_adapter(getattr(local_model.decoder, name), config, name, count) for name, count in groups)
+  # Use the same named policies as ordinary MaxText training.
+  checkpoint_policy = local_model.decoder.get_remat_policy()
+  adapters = tuple(
+      _make_layer_adapter(
+          getattr(local_model.decoder, name), config, name, count,
+          checkpoint_policy=checkpoint_policy,
+      )
+      for name, count in groups
+  )
   layer_apply, layer_params, layer_state = map(tuple, zip(*adapters))
   prefix_apply, loss_apply, boundary_params = _make_boundaries(local_model, config, loss_from_logits, layer_names)
   batch = _microbatches(data, config.gradient_accumulation_steps, config.micro_batch_size_to_train_on)
