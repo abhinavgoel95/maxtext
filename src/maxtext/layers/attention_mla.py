@@ -961,6 +961,10 @@ class MLA(Attention):
     low_rank = checkpoint_name(low_rank, "kv_wa_proj")
     low_rank_main, low_rank_rope = jnp.split(low_rank, [self.kv_lora_rank], axis=-1)
     low_rank_main = self.kv_norm(low_rank_main)
+    # Keep the MLA latent batch-sharded, with its feature dimension replicated.
+    # In the combined backward/forward loop, feature sharding can otherwise
+    # produce a much larger partial KV projection before reduce-scatter.
+    low_rank_main = jax.lax.with_sharding_constraint(low_rank_main, wkva_out_sharding)
     low_rank_main = checkpoint_name(low_rank_main, "mla_kv")
     # Apply rotary embedding to key_rope.
     key_rope = jnp.expand_dims(low_rank_rope, axis=2)
