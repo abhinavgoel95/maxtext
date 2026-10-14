@@ -4,8 +4,25 @@ The caller owns normalization and the optimizer update and jits the enclosing
 training step. This module sums loss, metrics, and gradients over microbatches.
 """
 
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclass(frozen=True)
+class _ModelValue:
+  """Static reference to an original weight/state leaf, not a saved array."""
+
+  index: int
+
+  def tree_flatten(self):
+    return (), self.index
+
+  @classmethod
+  def tree_unflatten(cls, index, children):
+    return cls(index)
 
 
 def _reduce_aux(stacked_aux):
@@ -61,8 +78,29 @@ def make_training_schedule(
   def make_layer_passes(apply):
     # Keep the existing behavior when full remat is not selected.
     if not full_remat:
-      forward, backward = jax.fwd_and_bwd(apply, argnums=(0, 1), has_aux=True, jitted=False)
-      return forward, lambda weights, state, saved, dy: backward(saved, dy)
+      raw_forward, raw_backward = jax.fwd_and_bwd(apply, argnums=(0, 1), has_aux=True, jitted=False)
+
+      def forward(weights, hidden, state, positions, segments):
+        output, saved, metrics = raw_forward(weights, hidden, state, positions, segments)
+        # A VJP can save the original weights/state alongside activations.
+        # Replace exact input references with static indices, so scan does not
+        # stack these model arrays again. Never infer identity from shape/value.
+        # Derived values (e.g. cast weights) remain residuals for correctness.
+        model_values = {id(x): i for i, x in enumerate(jax.tree.leaves((weights, state)))}
+        saved = jax.tree.map(
+            lambda x: _ModelValue(model_values[id(x)]) if id(x) in model_values else x, saved
+        )
+        return output, saved, metrics
+
+      def backward(weights, state, saved, dy):
+        model_values = jax.tree.leaves((weights, state))
+        saved = jax.tree.map(
+            lambda x: model_values[x.index] if isinstance(x, _ModelValue) else x,
+            saved, is_leaf=lambda x: isinstance(x, _ModelValue),
+        )
+        return raw_backward(saved, dy)
+
+      return forward, backward
 
     def forward(weights, hidden, state, positions, segments):
       output, metrics = apply(weights, hidden, state, positions, segments)
@@ -152,9 +190,30 @@ def make_training_schedule(
         layer_metrics = metrics if layer_metrics is None else sum_aux(layer_metrics, metrics)
       return hidden, tuple(residual_groups), layer_metrics
 
-    def backward_layers(residuals, dhidden):
+    def backward_layers(residuals, dhidden, reversed_storage=None):
       gradient_groups = [None] * len(params)
       for group in reversed(range(len(params))):
+        if reversed_storage is not None:
+          # Shared storage is currently only used for one homogeneous group.
+          # Read in logical backward order without reversing the whole stack.
+          length = boundaries[group + 1] - boundaries[group]
+
+          def shared_body(dhidden, index):
+            slot = jnp.where(reversed_storage, length - 1 - index, index)
+            residual = jax.tree.map(
+                lambda x: jax.lax.dynamic_index_in_dim(x, slot, keepdims=False), residuals[group]
+            )
+            weights, state = jax.tree.map(
+                lambda x: jax.lax.dynamic_index_in_dim(x, index, keepdims=False), (params[group], states[group])
+            )
+            with jax.named_scope("backward"):
+              dweights, dhidden = backwards[group](weights, state, residual, dhidden)
+            return dhidden, dweights
+
+          dhidden, gradient_groups[group] = jax.lax.scan(
+              shared_body, dhidden, jnp.arange(length), reverse=True
+          )
+          continue
         def body(dhidden, layer_data):
           # Weights/state come from the model, not from the saved activations.
           weights, state, residual = layer_data
@@ -278,6 +337,84 @@ def make_training_schedule(
           accumulate(layer_sum, layer_grads),
           boundary_sum,
       ), None
+
+    def shared_backward_forward(outer_carry, data):
+      carry, reversed_storage = outer_carry
+      prefix_res, residuals, dhidden, loss_sum, aux_sum, layer_sum, boundary_sum = carry
+      with jax.named_scope("prefix_forward"):
+        next_hidden, next_prefix_res = prefix_forward(boundary_params, data)
+
+      def combined_layer(carry, index):
+        dhidden, next_hidden, activation_buffer = carry
+        # B_i visits L-1-k while F_(i+1) visits k. Only storage order flips;
+        # model weights/state always use the logical layer indices.
+        backward_index = total_layers - 1 - index
+        slot = jnp.where(reversed_storage, index, backward_index)
+        backward_temp = jax.tree.map(
+            lambda x: jax.lax.dynamic_index_in_dim(x, slot, keepdims=False), activation_buffer
+        )
+        # Separate the one-layer read from its consumers. This is a compiler
+        # boundary, not a promise of a physical copy; inspect buffer assignment.
+        backward_temp = jax.lax.optimization_barrier(backward_temp)
+        backward_weights, backward_state = jax.tree.map(
+            lambda x: jax.lax.dynamic_index_in_dim(x, backward_index, keepdims=False), (params[0], states[0])
+        )
+        forward_weights, forward_state = jax.tree.map(
+            lambda x: jax.lax.dynamic_index_in_dim(x, index, keepdims=False), (params[0], states[0])
+        )
+        with jax.named_scope("backward"):
+          dweights, dhidden = backwards[0](backward_weights, backward_state, backward_temp, dhidden)
+        with jax.named_scope("forward"):
+          # These are the NEW saved activations, e.g. Q/K/V, for one layer.
+          # Forward has no dependency on backward's gradients or output.
+          next_hidden, forward_temp, metrics = forwards[0](
+              forward_weights, next_hidden, forward_state, data["inputs_position"], data["inputs_segmentation"]
+          )
+        # Gate only the replacement write on the old-slot read. Do not put
+        # dhidden/dweights here: that would wait for backward COMPUTE to finish.
+        # Backward consumes the earlier temporary, not this barrier's outputs.
+        _, forward_to_store = jax.lax.optimization_barrier((backward_temp, forward_temp))
+        activation_buffer = jax.tree.map(
+            lambda buffer, value: jax.lax.dynamic_update_index_in_dim(buffer, value, slot, axis=0),
+            activation_buffer, forward_to_store,
+        )
+        # Carry the updated buffer, rather than making scan stack a second set
+        # of saved activations. XLA may still insert defensive copies; verify.
+        return (dhidden, next_hidden, activation_buffer), (dweights, metrics)
+
+      with jax.named_scope("combined_bf_layers"):
+        (dprefix, next_hidden, activation_buffer), (reversed_grads, metrics) = jax.lax.scan(
+            combined_layer, (dhidden, next_hidden, residuals[0]), jnp.arange(total_layers)
+        )
+      # Only gradients are reversed to match model parameter order.
+      layer_grads = (jax.tree.map(lambda x: x[::-1], reversed_grads),)
+      with jax.named_scope("prefix_backward"):
+        prefix_grads, = prefix_backward(prefix_res, dprefix)
+      with jax.named_scope("head_loss_and_backward"):
+        (loss, aux), (head_grads, next_dhidden) = loss_and_grad(boundary_params, next_hidden, data)
+      carry = (
+          next_prefix_res, (activation_buffer,), next_dhidden, loss_sum + loss,
+          sum_aux(aux_sum, merge_layer_metrics(aux, _reduce_aux(metrics))),
+          accumulate(layer_sum, layer_grads), accumulate(accumulate(boundary_sum, prefix_grads), head_grads),
+      )
+      # New layers occupy the freed slots in the opposite physical order.
+      # Flip the indexing flag, not the tensor. No full-stack reverse/copy.
+      return (carry, ~reversed_storage), None
+
+    # Different layer groups may have incompatible saved shapes. Keep their
+    # existing path unchanged until a compatible-pool design is implemented.
+    if len(params) == 1:
+      with jax.named_scope("steady_Bi_Fnext"):
+        (carry, reversed_storage), _ = jax.lax.scan(
+            shared_backward_forward,
+            ((prefix_residuals, residuals, dhidden, loss_total, aux_total, layer_total, boundary_total), jnp.bool_(False)),
+            later_data,
+        )
+      prefix_residuals, residuals, dhidden, loss_total, aux_total, layer_total, boundary_total = carry
+      with jax.named_scope("drain_Blast"):
+        dprefix, layer_grads = backward_layers(residuals, dhidden, reversed_storage)
+        prefix_grads, = prefix_backward(prefix_residuals, dprefix)
+      return loss_total, aux_total, accumulate(layer_total, layer_grads), accumulate(boundary_total, prefix_grads)
 
     # F0, [B0 + F1], [B1 + F2], ..., B_last. Only the next microbatch's
     # residuals persist in the outer carry; old/new residuals can coexist inside.

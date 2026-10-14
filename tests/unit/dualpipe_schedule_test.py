@@ -147,6 +147,30 @@ class DenseTrainingScheduleTest(unittest.TestCase):
     for leaf in jax.tree.leaves(result):
       np.testing.assert_array_equal(leaf, jnp.zeros_like(leaf))
 
+  def test_shared_activation_storage_alternates_with_checkpointing(self):
+    # GA=2/3/4 exercises both final storage directions and repeated slot reuse.
+    # Compare every gradient, not just the loss, to independent autodiff.
+    for microbatches in (2, 3, 4):
+      params, state, boundary, data = make_inputs(3, microbatches)
+      (loss, aux), (layer_grads, boundary_grads) = jax.value_and_grad(
+          reference_loss, argnums=(0, 1), has_aux=True
+      )(params, boundary, state, data)
+      for full_remat in (False, True):
+        with self.subTest(microbatches=microbatches, full_remat=full_remat):
+          policy = (
+              jax.checkpoint_policies.nothing_saveable if full_remat
+              else jax.checkpoint_policies.dots_saveable
+          )
+          step = jax.jit(make_training_schedule(
+              prefix_apply, (jax.checkpoint(layer_apply, policy=policy),), loss_apply,
+              full_remat=full_remat,
+          ))
+          for _ in range(2):
+            self.assert_tree_allclose(
+                step((params,), (state,), boundary, data),
+                (loss, aux, (layer_grads,), boundary_grads),
+            )
+
   def test_full_remat_matches_full_autodiff(self):
     args = make_inputs(3, 3)
     params, state, boundary, data = args
