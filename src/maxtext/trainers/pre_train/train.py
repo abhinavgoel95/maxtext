@@ -406,7 +406,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   loss_model, loss_params, loss_rng = state.model, None, None
 
   # --- Gradient computation ---
-  if getattr(config, "gradient_accumulation_schedule", "serial") == "dual_pipe":
+  # adapter_serial isolates adapter/remat effects from the combined BF loop.
+  if getattr(config, "gradient_accumulation_schedule", "serial") in ("dual_pipe", "adapter_serial"):
     from maxtext.experimental.dualpipe_nnx import dualpipe_loss_and_grad  # pylint: disable=import-outside-toplevel
 
     loss, aux, raw_grads = dualpipe_loss_and_grad(config, loss_model, params_shardings, data, loss_from_logits)

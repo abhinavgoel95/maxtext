@@ -2314,9 +2314,9 @@ class Optimizer(BaseModel):
   gradient_accumulation_steps: PositiveInt = Field(
       1, description="Number of steps to accumulate gradients before updating."
   )
-  gradient_accumulation_schedule: Literal["serial", "dual_pipe"] = Field(
+  gradient_accumulation_schedule: Literal["serial", "dual_pipe", "adapter_serial"] = Field(
       "serial",
-      description="Gradient accumulation schedule; dual_pipe enables experimental fused Llama/DeepSeek layer scans.",
+      description="Gradient accumulation schedule; dual_pipe fuses layer scans; adapter_serial diagnoses the same adapter without BF overlap.",
   )
   use_tunix_gradient_accumulation: bool = Field(
       False,
