@@ -1306,7 +1306,19 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   ep_size = mesh.shape.get(ep_axis, 1)
   fsdp_size = mesh.shape.get(fsdp_axis, 1)
 
-  batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  loaded_batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  ga_steps = config.gradient_accumulation_steps
+  if ga_steps < 1 or loaded_batch_size % ga_steps:
+    raise ValueError("TE MoE EP requires a positive GA count dividing the loaded batch.")
+  # Size EP buffers for one forward/backward invocation, not all GA microbatches.
+  # Also cover model initialization and evaluation, which share this bootstrap.
+  batch_size = max(loaded_batch_size // ga_steps, config.micro_batch_size_to_train_on)
+  if config.eval_interval > 0:
+    batch_size = max(batch_size, config.micro_batch_size_to_eval_on)
+  if batch_size <= 0 or batch_size % (fsdp_size * ep_size):
+    raise ValueError(
+        f"TE MoE EP per-call batch size ({batch_size}) must be positive and divisible by FSDP * EP ({fsdp_size * ep_size})."
+    )
   if config.num_experts % ep_size != 0:
     raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
 
