@@ -25,8 +25,8 @@ def validate_training_config(config):
     raise ValueError("At least one decoder layer is required")
   if config.shard_mode != ShardMode.AUTO:
     raise ValueError("dual_pipe currently requires shard_mode=auto")
-  if config.remat_policy not in ("none", "full", "save_qkv_proj", "minimal_with_context", "custom"):
-    raise ValueError("dual_pipe supports remat_policy=none, full, save_qkv_proj, minimal_with_context, or custom")
+  if config.remat_policy not in ("none", "full", "save_qkv_proj", "minimal_with_context", "save_dot_except_mlpwi", "custom"):
+    raise ValueError("dual_pipe supports remat_policy=none, full, save_qkv_proj, minimal_with_context, save_dot_except_mlpwi, or custom")
   if config.dropout_rate != 0:
     raise ValueError("dual_pipe requires dropout_rate=0; layer state is read-only")
   if config.mtp_num_layers != 0:
