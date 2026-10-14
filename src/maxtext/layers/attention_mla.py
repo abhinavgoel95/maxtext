@@ -793,6 +793,9 @@ class MLA(Attention):
       low_rank_q = self.wq_a(inputs_q, out_sharding=wqa_out_sharding)  # [B, L, q_lora_rank]
       low_rank_q = checkpoint_name(low_rank_q, "query_wa_proj")
       low_rank_q = self.q_norm(low_rank_q)  # RMSNorm on low rank
+      # Keep query latents batch-sharded with all features on each GPU.
+      # Avoid a full-batch partial projection followed by reduce-scatter.
+      low_rank_q = jax.lax.with_sharding_constraint(low_rank_q, wqa_out_sharding)
       low_rank_q = checkpoint_name(low_rank_q, "mla_q")
       if self.config.use_sliced_mla_proj and self.wq_b.quant is None:
         q_nope = self.wq_b(
