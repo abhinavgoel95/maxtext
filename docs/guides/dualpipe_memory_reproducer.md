@@ -8,15 +8,23 @@ Initial XLA allocation, GiB per GPU, on 16 nodes × 4 GB300 GPUs,
 | Schedule | GA | Temporary arena | Other allocations | Total |
 | --- | ---: | ---: | ---: | ---: |
 | Standard serial | 3 | 128.31 | 28.48 | 156.79 |
-| Dual-pipe | 4 | 218.87 | 28.48 | 247.35 |
+| Dual-pipe | 3 | 229.36 | 28.48 | 257.84 |
 
-The 90.56 GiB difference is almost entirely temporary allocation. **GA differs:
-this is an observation, not a controlled measurement of schedule-only overhead.**
+The matched GA=3 comparison shows **101.05 GiB (+64.4%) more total allocation**
+for dual-pipe, almost entirely in the temporary arena. Source, container, model,
+mesh, remat, quantization, capacity and flags are identical; only schedule and
+run/output names change.
 Neither run reached a training step or PGLE recompilation: both encountered
-a Triton scalar-collective LLVM struct-packing error after emitting HLO and
+a Triton collective LLVM struct-packing error after emitting HLO and
 buffer assignments. These are compiler allocations, not measured peak HBM use.
+Serial failed compiling an `f32[]` all-reduce; dual-pipe failed on an `s32[28]`
+all-reduce, both with `expected 2 but got 1`. No runtime OOM was reported.
 
-Both MLA latent constraints are included. The earlier full-batch projection
+For context, the earlier dual-pipe GA=4 compilation allocated 247.35 GiB
+(218.87 GiB temporary). It is not the baseline for the matched table above.
+
+Both MLA latent constraints are included. In the inspected GA=4 dual-pipe HLO,
+the earlier full-batch projection
 intermediates are absent: local query output is `bf16[6,4096,128,192]`
 (1.125 GiB), and local KV output is `bf16[6,4096,128,256]` (1.5 GiB).
 
@@ -25,7 +33,9 @@ iterations. Each segment returns saved forward residuals; the 25-layer and
 3-layer MoE pieces are concatenated into the next microbatch's 28-layer stack.
 The homogeneous-group shared-storage path does not apply to this mixed model.
 
-Buffer assignment contains:
+The earlier GA=4 dual-pipe buffer assignment contains these candidates for
+investigation (their peak contributions have not been established for GA=3):
+
 - `bf16[28,6,4096,128,128]`: 21 GiB.
 - `bf16[25,6,4096,128,128]`: 18.75 GiB; HLO shows a segment
   dynamic-update-slice and a double-buffer clone.
@@ -69,14 +79,15 @@ shared writable `OUTPUT_ROOT`. The Slurm rank environment must be propagated
 for the normal MaxText GPU multiprocess bootstrap. This block is a per-rank
 command, not a command to run once on the login node.
 
-To reproduce the observed table, use serial/GA3 and dual_pipe/GA4.
-For a controlled comparison, use **GA4 in both** (serial GA4 is not yet measured).
+Launch two separate jobs using this same command: first `SCHEDULE=serial`, then
+`SCHEDULE=dual_pipe`. Keep **GA=3 in both** and change only the schedule and run
+name. Use standard `serial`, not the diagnostic `adapter_serial` route.
 
 ```bash
 cd /opt/maxtext
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 SCHEDULE=dual_pipe   # serial for ordinary MaxText GA; not adapter_serial
-GA=4                # use 3 only to reproduce the historical serial row
+GA=3                # identical in the serial and dual_pipe jobs
 RUN_NAME="memory-${SCHEDULE}-ga${GA}-trial1"
 OUTPUT_ROOT=/output # mount a shared writable output directory here
 mkdir -p "${OUTPUT_ROOT}/${RUN_NAME}"
@@ -196,6 +207,7 @@ Trace producer/consumer lifetimes and allocation offsets before attributing
 bytes to individual causes; aliases and reused storage must not be counted twice.
 Check that neither MLA projection has a full-batch expanded output.
 
-This is a workload-level reproduction recipe. A smaller standalone JAX
-reproducer and a matched-GA attribution of the memory difference remain open.
+This is a workload-level reproduction recipe with a measured matched-GA gap.
+A smaller standalone JAX reproducer and exact attribution of that gap to
+simultaneously live buffers, placement overhead, and adapter behavior remain open.
 
