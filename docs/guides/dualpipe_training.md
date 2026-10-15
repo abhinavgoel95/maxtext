@@ -45,7 +45,8 @@ in the deployment/launcher configuration, not in MaxText wrapper scripts.
 - NNX Llama (`decoder_block=llama2`) or DeepSeek V3 with `te_moe_block=true`;
   DeepSeek also requires compatible Transformer Engine and one GPU per process.
 - `scan_layers=true`, `shard_mode=auto`, and `dropout_rate=0`.
-- `remat_policy=none` or `full`; custom remat is not supported here.
+- This experiment branch supports `remat_policy=none`, `full`, `save_qkv_proj`,
+  `minimal_with_context`, `save_dot_except_mlpwi`, and `custom`.
 - Llama is unquantized. DeepSeek supports `quantization=te_no_quant` or
   `te_fp8_currentscaling`, and `te_gmm_quantization=te_no_quant` or `te_mxfp8`.
 - DeepSeek requires `load_balance_loss_weight=0` and
@@ -64,7 +65,9 @@ being in one HLO computation does not guarantee concurrent execution.
 Full remat recomputes the old microbatch's forward work during backward;
 this is distinct from the next microbatch's forward branch. Old and new saved
 values can coexist, so peak memory can exceed the serial schedule.
-TE-EP bootstrap capacity sizing is unchanged by this scheduling feature.
+This experiment branch also includes per-call TE-EP capacity sizing and MLA
+latent sharding constraints. See the [memory reproduction instructions](dualpipe_memory_reproducer.md)
+for the pinned source, configuration, observed allocations, and limitations.
 
 CPU tests cover loss/gradient bookkeeping and scan structure, not full-model
 numerical equivalence, TE communication correctness, or measured GPU overlap.
