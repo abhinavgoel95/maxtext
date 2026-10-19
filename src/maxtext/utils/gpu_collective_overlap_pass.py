@@ -58,7 +58,7 @@ _profile_costs: dict[str, float] = {}
 # ---------------------------------------------------------------------------
 _XLA_SRC = os.environ.get("COLLECTIVE_OVERLAP_XLA_PATH", "")
 _TSL_SRC = f"{_XLA_SRC}/third_party/tsl"
-_PROTO_OUT_DIR_BASE = "/tmp/_collective_overlap_pass_proto"
+_PROTO_OUT_DIR_BASE = "/tmp/_gpu_collective_overlap_pass_proto"
 
 _PROTO_SOURCES = [
     "tsl/profiler/protobuf/profiled_instructions.proto",
@@ -140,14 +140,14 @@ def _ensure_protos():
             )
         except subprocess.CalledProcessError as exc:
             _logger.warning(
-                "collective_overlap_pass: protoc failed: %s", exc.stderr.decode("utf-8", errors="replace")[-1000:],
+                "gpu_collective_overlap_pass: protoc failed: %s", exc.stderr.decode("utf-8", errors="replace")[-1000:],
             )
             shutil.rmtree(tmp, ignore_errors=True)
             raise
         patched = _relax_gencode_version(tmp)
         if patched:
             _logger.warning(
-                "collective_overlap_pass: protoc is newer than the Python protobuf runtime; "
+                "gpu_collective_overlap_pass: protoc is newer than the Python protobuf runtime; "
                 "removed the gencode version check from %d generated module(s).", patched,
             )
         try:
@@ -178,11 +178,11 @@ def _update_profile(fdo_bytes: bytes) -> None:
         _profile_costs.update(_te_ep_overrides)
         n_coll = sum(1 for k in costs if "all-gather" in k or "reduce-scatter" in k)
         _logger.info(
-            "collective_overlap_pass: merged PGLE profile chunk: %d entries (%d collectives); pool now %d.",
+            "gpu_collective_overlap_pass: merged PGLE profile chunk: %d entries (%d collectives); pool now %d.",
             len(costs), n_coll, len(_profile_costs),
         )
     except Exception as exc:  # pylint: disable=broad-except
-        _logger.warning("collective_overlap_pass: failed to parse FDO profile: %s", exc)
+        _logger.warning("gpu_collective_overlap_pass: failed to parse FDO profile: %s", exc)
 
 # TODO tixxx remove the above invocation cost once PGLE can return the
 # correct aggregated cost for multi-kernel ops.
@@ -241,7 +241,7 @@ def _load_costs_from_xspace_bytes(xspace_bytes: bytes, prefixes=None) -> dict[st
         xspace = _xp.XSpace()
         xspace.ParseFromString(xspace_bytes)
     except Exception as exc:  # pylint: disable=broad-except
-        _logger.warning("collective_overlap_pass: failed to parse live XSpace profile: %s", exc)
+        _logger.warning("gpu_collective_overlap_pass: failed to parse live XSpace profile: %s", exc)
         return {}
 
     by_op: dict[str, list[tuple[float, float]]] = {}
@@ -292,7 +292,7 @@ _dist_client = None
 _dist_checked = False
 
 # Count of invocations that got past the early-out; names the barriers and the
-# KV key (see _collective_overlap_pass for why not a content hash).
+# KV key (see _gpu_collective_overlap_pass for why not a content hash).
 _barrier_invocation_count = 0
 
 
@@ -307,7 +307,7 @@ def _get_distributed_client():
             _process_id = _jax_distributed.global_state.process_id
             _process_count = _jax_distributed.global_state.num_processes
             _logger.info(
-                "collective_overlap_pass: JAX distributed client: process_id=%d process_count=%d host=%s pid=%d.%s",
+                "gpu_collective_overlap_pass: JAX distributed client: process_id=%d process_count=%d host=%s pid=%d.%s",
                 _process_id, _process_count, socket.gethostname(), os.getpid(),
                 "" if (_dist_client is not None and _process_count > 1) else (
                     " WARNING: no multi-process client; every rank will compute its own "
@@ -316,7 +316,7 @@ def _get_distributed_client():
             )
         except Exception as exc:  # pylint: disable=broad-except
             _logger.warning(
-                "collective_overlap_pass: jax distributed client unavailable (%s); "
+                "gpu_collective_overlap_pass: jax distributed client unavailable (%s); "
                 "each rank will use its own schedule, which risks divergence.", exc,
             )
             _dist_client = None
@@ -447,11 +447,13 @@ def _register_host_offload_copies(module) -> None:
     _host_offload_copy_names.update(names)
     if names:
         _logger.info(
-            "collective_overlap_pass [%s]: registered %d host-offload copy instruction(s) (starts and dones): %s",
+            "gpu_collective_overlap_pass [%s]: registered %d host-offload copy instruction(s) (starts and dones): %s",
             module.name, len(names), ", ".join(sorted(names)),
         )
 
-
+# This tells the main loop of the pass of what the interesting ops are
+# for optimization. Add additional logic here to match any future ops
+# to be scheduled.
 def _is_async_start(inst: object) -> bool:
     """True if `inst` is the Start half of an async collective.
 
@@ -881,7 +883,7 @@ def _relocate_async_done_before_te_ep(
         schedule, comp, _reinsert(seq, [], target, async_done)
     )
     _logger.info(
-        "collective_overlap_pass [%s]: moved %s done from pos %d to %d, before te_ep call-start %s "
+        "gpu_collective_overlap_pass [%s]: moved %s done from pos %d to %d, before te_ep call-start %s "
         "(latency %.1f us closed by pos %d).",
         module_name, async_done.name, done_pos, target, seq[target].name,
         collective_latency, latency_closure_pos,
@@ -1048,7 +1050,7 @@ def _try_relocate_blocker_earlier(
     if improves_total:
         target = best_pos
         _logger.debug(
-            "collective_overlap_pass [%s]: TRC %s: pos %d -> %d (chain %d), total exposed %.1f -> %.1f us (path 1).",
+            "gpu_collective_overlap_pass [%s]: TRC %s: pos %d -> %d (chain %d), total exposed %.1f -> %.1f us (path 1).",
             module_name, blocker.name, blocker_pos, best_pos + len(chain),
             len(chain), current_total, best_exposed,
         )
@@ -1057,7 +1059,7 @@ def _try_relocate_blocker_earlier(
         if cost <= margin:
             target = floor
             _logger.debug(
-                "collective_overlap_pass [%s]: TRC %s: pos %d -> %d (chain %d), margin-safe "
+                "gpu_collective_overlap_pass [%s]: TRC %s: pos %d -> %d (chain %d), margin-safe "
                 "(cost %.1f <= margin %.1f us) (path 2).",
                 module_name, blocker.name, blocker_pos, floor + len(chain),
                 len(chain), cost, margin,
@@ -1257,7 +1259,7 @@ def _chase_heavy_compute_blocker_chain(
             candidate, positions, name_to_pos, comp_by_name
         )
     _logger.debug(
-        "collective_overlap_pass [%s]: CHC %s: %s after %d/%d hop(s), floor=%d, done_pos=%d.",
+        "gpu_collective_overlap_pass [%s]: CHC %s: %s after %d/%d hop(s), floor=%d, done_pos=%d.",
         module_name, candidate.name, "resolved" if floor <= async_done_pos else "gave up",
         hops, max_hops, floor, async_done_pos,
     )
@@ -1408,7 +1410,7 @@ def _fill_exposed_collectives_with_heavy_compute(
         if give_up_now:
             given_up_candidates.add(inst.name)
             _logger.debug(
-                "collective_overlap_pass [%s]: window %s: giving up on %s after %d unresolved "
+                "gpu_collective_overlap_pass [%s]: window %s: giving up on %s after %d unresolved "
                 "chase restarts (mode=%s, floor stuck at %d).",
                 module_name, window["start"].name, inst.name, streak, give_up_mode, floor,
             )
@@ -1421,7 +1423,7 @@ def _fill_exposed_collectives_with_heavy_compute(
                 chase_hops += 1
                 changed = pass_changed = True
                 _logger.info(
-                    "collective_overlap_pass [%s]: chased exposed-collective blocker %s earlier "
+                    "gpu_collective_overlap_pass [%s]: chased exposed-collective blocker %s earlier "
                     "to unblock %s for window %s (deficit %.1f us).",
                     module_name, start_of_done[blocker].name, inst.name,
                     window["start"].name, window["deficit"],
@@ -1610,7 +1612,7 @@ def _fill_exposed_collectives_with_heavy_compute(
                 )
                 changed = pass_changed = True
                 _logger.info(
-                    "collective_overlap_pass [%s]: relocated heavy compute %s (cost %.1f us) into "
+                    "gpu_collective_overlap_pass [%s]: relocated heavy compute %s (cost %.1f us) into "
                     "window of %s (pre-relocation deficit %.1f us).",
                     module_name, candidate.name, _resolve_inst_cost(candidate, comp_by_name),
                     window["start"].name, prev_deficit,
@@ -1717,13 +1719,13 @@ def _log_profile_coverage_gaps(module, schedule, module_name: str) -> None:
                 missing.append(f"{inst.name}({opc})")
 
     _logger.info(
-        "collective_overlap_pass [%s]: profile coverage in %d while body(ies): %d/%d "
+        "gpu_collective_overlap_pass [%s]: profile coverage in %d while body(ies): %d/%d "
         "fusion/custom-call instructions have a PGLE cost (%d missing).",
         module_name, len(while_bodies), total - len(missing), total, len(missing),
     )
     if missing:
         _logger.info(
-            "collective_overlap_pass [%s]: missing-profile instructions (first 150 of %d): %s",
+            "gpu_collective_overlap_pass [%s]: missing-profile instructions (first 150 of %d): %s",
             module_name, len(missing), ", ".join(missing[:150]),
         )
 
@@ -1760,7 +1762,7 @@ def _fill_exposed_collectives_best_of(
             comp_by_name, module_name, give_up_mode=cached_mode, is_while_body=is_while_body,
         )
         _logger.info(
-            "collective_overlap_pass [%s]: comp %s: cached fill strategy '%s': total exposed "
+            "gpu_collective_overlap_pass [%s]: comp %s: cached fill strategy '%s': total exposed "
             "%.1f -> %.1f us (changed=%s).",
             module_name, comp.name, cached_mode, pre_total,
             _total_exposed_us(start_of_done, positions, seq, comp_by_name), changed,
@@ -1783,7 +1785,7 @@ def _fill_exposed_collectives_best_of(
         )
         total = _total_exposed_us(start_of_done, trial_positions, trial_seq, comp_by_name)
         _logger.info(
-            "collective_overlap_pass [%s]: fill strategy '%s' for comp %s: total exposed %.1f us (changed=%s).",
+            "gpu_collective_overlap_pass [%s]: fill strategy '%s' for comp %s: total exposed %.1f us (changed=%s).",
             module_name, mode, comp.name, total, trial_changed,
         )
         if best is None or total < best[0] - 1e-6:
@@ -1793,7 +1795,7 @@ def _fill_exposed_collectives_best_of(
     schedule.set_sequence(comp, seq)
     _fill_strategy_cache[comp.name] = mode
     _logger.info(
-        "collective_overlap_pass [%s]: comp %s: selected fill strategy '%s' (total exposed %.1f us).",
+        "gpu_collective_overlap_pass [%s]: comp %s: selected fill strategy '%s' (total exposed %.1f us).",
         module_name, comp.name, mode, total,
     )
     return changed, seq, positions, name_to_pos
@@ -2041,7 +2043,7 @@ def _hoist_async_starts_to_floor(
             new_seq = [i for i in seq if i is not inst]
             if len(new_seq) != len(seq) - 1:
                 _logger.warning(
-                    "collective_overlap_pass [%s]: HOISTDIAG %s not found exactly once in sequence; skipping move.",
+                    "gpu_collective_overlap_pass [%s]: HOISTDIAG %s not found exactly once in sequence; skipping move.",
                     module_name, inst.name,
                 )
                 return False
@@ -2088,7 +2090,7 @@ def _hoist_async_starts_to_floor(
             except Exception:
                 sim_lat[s_inst] = 0.0
         _logger.info(
-            "collective_overlap_pass [%s]: stream model: %s simulated total exposed %.1f us before async placement "
+            "gpu_collective_overlap_pass [%s]: stream model: %s simulated total exposed %.1f us before async placement "
             "(%d collective latencies from per-invocation clustering).",
             module_name, comp.name, _simulate_comm_stream(seq, sim_cost, sim_lat, start_of_done, sim_gate)[0],
             n_lat_overridden,
@@ -2110,7 +2112,7 @@ def _hoist_async_starts_to_floor(
                 break  # a data dependency pins the floor, not a control-predecessor
             if not _move_earlier(seq[pin_pos], _MAX_PRED_HOIST_DEPTH):
                 _logger.debug(
-                    "collective_overlap_pass [%s]: %s floor %d pinned by control-predecessor %s "
+                    "gpu_collective_overlap_pass [%s]: %s floor %d pinned by control-predecessor %s "
                     "(pos %d) which could not be hoisted.",
                     module_name, async_start.name, floor, pin_name, pin_pos,
                 )
@@ -2131,13 +2133,13 @@ def _hoist_async_starts_to_floor(
                     "seq idx %d: %.1f us%s" % (c[1], c[0], " [dropped]" if c[2] else "") for c in cs
                 ) or "none"
                 _logger.debug(
-                    "collective_overlap_pass [%s]: STREAMCANDS %s: %d candidates (%d dropped by async-stall guard); "
+                    "gpu_collective_overlap_pass [%s]: STREAMCANDS %s: %d candidates (%d dropped by async-stall guard); "
                     "current %.1f us; lowest %s; lowest later than current %s.",
                     module_name, async_start.name, len(cand_diag), sum(1 for c in cand_diag if c[2]), before,
                     fmt(top), fmt(later),
                 )
             _logger.debug(
-                "collective_overlap_pass [%s]: STREAMDIAG %s: start pos %d, done pos %d, floor %d, to_move %d, "
+                "gpu_collective_overlap_pass [%s]: STREAMDIAG %s: start pos %d, done pos %d, floor %d, to_move %d, "
                 "latency %.1f us, simulated total %.1f us; best %s.",
                 module_name, async_start.name, start_pos, positions[async_done], floor, len(to_move),
                 sim_lat.get(async_start, 0.0), before,
@@ -2156,7 +2158,7 @@ def _hoist_async_starts_to_floor(
                         seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
                         changed = True
                         _logger.info(
-                            "collective_overlap_pass [%s]: stream model placed %s: start pos %d -> %d, done pos %d -> %d "
+                            "gpu_collective_overlap_pass [%s]: stream model placed %s: start pos %d -> %d, done pos %d -> %d "
                             "(simulated total exposed %.1f -> %.1f us).",
                             module_name, async_start.name, orig_pos, positions[async_start],
                             done_pos_old, positions[async_done], before, key[0],
@@ -2169,7 +2171,7 @@ def _hoist_async_starts_to_floor(
         )
         changed = True
         _logger.info(
-            "collective_overlap_pass [%s]: hoisted %s from pos %d to %d with %d relocated operand(s).",
+            "gpu_collective_overlap_pass [%s]: hoisted %s from pos %d to %d with %d relocated operand(s).",
             module_name, async_start.name, orig_pos, positions[async_start], len(to_move),
         )
     return changed, seq, positions, name_to_pos
@@ -2199,7 +2201,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
                     start_of_done[users[0]] = inst
                 else:
                     _logger.debug(
-                        "collective_overlap_pass [%s]: async-start %s has %d users (expected its done only); skipping.",
+                        "gpu_collective_overlap_pass [%s]: async-start %s has %d users (expected its done only); skipping.",
                         module_name, inst.name, len(users),
                     )
 
@@ -2214,7 +2216,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
             collective_latency = _profile_costs.get(profile_key)
             if collective_latency is None or collective_latency <= 0:
                 _logger.debug(
-                    "collective_overlap_pass [%s]: no profile entry for %s (resolved key: %s).",
+                    "gpu_collective_overlap_pass [%s]: no profile entry for %s (resolved key: %s).",
                     module_name, async_start.name, profile_key,
                 )
                 continue
@@ -2239,7 +2241,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
 
             deficit = collective_latency - current_overlap
             _logger.debug(
-                "collective_overlap_pass [%s]: %s deficit=%.1f us (latency=%.1f us, overlap=%.1f us).",
+                "gpu_collective_overlap_pass [%s]: %s deficit=%.1f us (latency=%.1f us, overlap=%.1f us).",
                 module_name, async_start.name, deficit, collective_latency, current_overlap,
             )
 
@@ -2278,7 +2280,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
                 for i in range(positions[async_start] + 1, positions[async_done])
             )
             _logger.info(
-                "collective_overlap_pass: moving %s from pos %d to %d with %d relocated operand(s) "
+                "gpu_collective_overlap_pass: moving %s from pos %d to %d with %d relocated operand(s) "
                 "(overlap %.1f -> %.1f us, latency=%.1f us).",
                 async_start.name, orig_async_start_pos, positions[async_start],
                 len(to_move), current_overlap, new_overlap, collective_latency,
@@ -2356,12 +2358,12 @@ def _log_final_exposed_summary(module, schedule, module_name: str, label: str) -
     per_comp.sort(key=lambda x: -x[1])
     per_collective.sort(key=lambda x: -x[2])
     _logger.info(
-        "collective_overlap_pass [%s]: FINAL exposed summary [%s]: grand_total=%.1f us across %d computation(s): %s",
+        "gpu_collective_overlap_pass [%s]: FINAL exposed summary [%s]: grand_total=%.1f us across %d computation(s): %s",
         module_name, label, sum(t for _, t in per_comp), len(per_comp),
         ", ".join(f"{name}={total:.1f}us" for name, total in per_comp),
     )
     _logger.info(
-        "collective_overlap_pass [%s]: FINAL per-collective exposed [%s]: %s",
+        "gpu_collective_overlap_pass [%s]: FINAL per-collective exposed [%s]: %s",
         module_name, label,
         ", ".join(f"{comp_name}/{name}={deficit:.1f}us" for comp_name, name, deficit in per_collective),
     )
@@ -2399,7 +2401,7 @@ def _hoist_host_offload_copy_starts(module, schedule, module_name: str) -> bool:
                 and len(list(operands[0].users())) > 1
             ):
                 _logger.info(
-                    "collective_overlap_pass [%s]: host-offload copy %s: host buffer %s has other users; not hoisting.",
+                    "gpu_collective_overlap_pass [%s]: host-offload copy %s: host buffer %s has other users; not hoisting.",
                     module_name, start.name, operands[0].name,
                 )
                 continue
@@ -2415,7 +2417,7 @@ def _hoist_host_offload_copy_starts(module, schedule, module_name: str) -> bool:
             seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
             changed = True
             _logger.info(
-                "collective_overlap_pass [%s]: hoisted host-offload copy %s in %s from pos %d to %d with %d relocated operand(s).",
+                "gpu_collective_overlap_pass [%s]: hoisted host-offload copy %s in %s from pos %d to %d with %d relocated operand(s).",
                 module_name, start.name, comp.name, old_pos, positions[start], len(movable),
             )
     return changed
@@ -2443,7 +2445,7 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
     else:
         # Cap reached: the last update() was never rechecked, so run one more pass.
         _logger.warning(
-            "collective_overlap_pass [%s]: reorder fixed point not reached after %d iterations; "
+            "gpu_collective_overlap_pass [%s]: reorder fixed point not reached after %d iterations; "
             "running one final pass.",
             module_name, _MAX_REORDER_ITERS,
         )
@@ -2462,7 +2464,7 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
 
 def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
     """Reorder the schedule using the PGLE profile. Runs on rank 0 only; see
-    _collective_overlap_pass."""
+    _gpu_collective_overlap_pass."""
     if not _profile_costs:
         return None
 
@@ -2483,7 +2485,7 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
     return module.as_serialized_hlo_module_proto()
 
 
-def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
+def _gpu_collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
     """Run the pass on rank 0 and share its output bytes with every rank.
 
     Every rank must compile a byte-identical executable, so only rank 0
@@ -2496,7 +2498,7 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
     # entered even if a hang happens later in XLA.
     _t_enter = time.monotonic()
     _logger.info(
-        "collective_overlap_pass: ENTER host=%s pid=%d input_bytes=%d",
+        "gpu_collective_overlap_pass: ENTER host=%s pid=%d input_bytes=%d",
         socket.gethostname(), os.getpid(), len(serialized_hlo),
     )
 
@@ -2506,7 +2508,7 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
     module = _hlo.HloModule.from_serialized_hlo_module_proto(serialized_hlo)
     if not _module_has_interesting_async_ops(module):
         _logger.info(
-            "collective_overlap_pass: EXIT host=%s pid=%d module=%s result=no-op (no async ops; %.1f ms).",
+            "gpu_collective_overlap_pass: EXIT host=%s pid=%d module=%s result=no-op (no async ops; %.1f ms).",
             socket.gethostname(), os.getpid(), module.name,
             (time.monotonic() - _t_enter) * 1000,
         )
@@ -2523,16 +2525,16 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
         _in_pid = os.getpid()
         _content_digest = hashlib.sha256(_module_text.encode()).hexdigest()
         _logger.info(
-            "collective_overlap_pass: PRE-PASS INPUT HASH rank=%d host=%s pid=%d module=%s sha256=%s bytes=%d text_bytes=%d",
+            "gpu_collective_overlap_pass: PRE-PASS INPUT HASH rank=%d host=%s pid=%d module=%s sha256=%s bytes=%d text_bytes=%d",
             _in_rank, _in_host, _in_pid, module.name, _content_digest,
             len(serialized_hlo), len(_module_text),
         )
         sys.stderr.write(
-            f"[collective_overlap_pass] === BEGIN PRE-PASS INPUT MODULE "
+            f"[gpu_collective_overlap_pass] === BEGIN PRE-PASS INPUT MODULE "
             f"(rank={_in_rank} host={_in_host} pid={_in_pid} "
             f"module={module.name} sha256={_content_digest}) ===\n"
             f"{_module_text}\n"
-            f"[collective_overlap_pass] === END PRE-PASS INPUT MODULE "
+            f"[gpu_collective_overlap_pass] === END PRE-PASS INPUT MODULE "
             f"(rank={_in_rank} module={module.name}) ===\n"
         )
 
@@ -2542,13 +2544,13 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
     _entry_name = _exit_name = None
     if multi_process:
         _barrier_invocation_count += 1
-        _entry_name = f"collective_overlap_pass_entry_{_barrier_invocation_count}"
-        _exit_name = f"collective_overlap_pass_exit_{_barrier_invocation_count}"
+        _entry_name = f"gpu_collective_overlap_pass_entry_{_barrier_invocation_count}"
+        _exit_name = f"gpu_collective_overlap_pass_exit_{_barrier_invocation_count}"
         try:
             client.wait_at_barrier(_entry_name, _SHARE_TIMEOUT_MS)
         except Exception as exc:  # pylint: disable=broad-except
             _logger.warning(
-                "collective_overlap_pass: entry barrier %s failed (%s); proceeding without it.",
+                "gpu_collective_overlap_pass: entry barrier %s failed (%s); proceeding without it.",
                 _entry_name, exc,
             )
 
@@ -2557,13 +2559,13 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
         _t_compute = time.monotonic()
         result_bytes = _compute_collective_overlap(serialized_hlo)
         _logger.info(
-            "collective_overlap_pass: _compute_collective_overlap done (%s, %.1f ms).",
+            "gpu_collective_overlap_pass: _compute_collective_overlap done (%s, %.1f ms).",
             "no-op" if result_bytes is None else f"{len(result_bytes)} bytes",
             (time.monotonic() - _t_compute) * 1000,
         )
 
     if multi_process:
-        _key = f"collective_overlap_pass_kv_{_barrier_invocation_count}"
+        _key = f"gpu_collective_overlap_pass_kv_{_barrier_invocation_count}"
         try:
             if is_root:
                 _payload = _SHARE_NONE if result_bytes is None else _SHARE_SOME + result_bytes
@@ -2573,7 +2575,7 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
                 result_bytes = None if _payload == _SHARE_NONE else _payload[len(_SHARE_SOME):]
         except Exception as exc:  # pylint: disable=broad-except
             _logger.warning(
-                "collective_overlap_pass: sharing the scheduled module via the JAX distributed client "
+                "gpu_collective_overlap_pass: sharing the scheduled module via the JAX distributed client "
                 "failed (%s); using this rank's own result, which risks divergent schedules.", exc,
             )
             if not is_root:
@@ -2583,7 +2585,7 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
             client.wait_at_barrier(_exit_name, _SHARE_TIMEOUT_MS)
         except Exception as exc:  # pylint: disable=broad-except
             _logger.warning(
-                "collective_overlap_pass: exit barrier %s failed (%s); proceeding without it.",
+                "gpu_collective_overlap_pass: exit barrier %s failed (%s); proceeding without it.",
                 _exit_name, exc,
             )
 
@@ -2596,20 +2598,20 @@ def _collective_overlap_pass(serialized_hlo: bytes) -> Optional[bytes]:
         _final_module = _hlo.HloModule.from_serialized_hlo_module_proto(result_bytes)
         _module_name = _final_module.name
         _logger.info(
-            "collective_overlap_pass: POST-SHARE HASH rank=%d host=%s pid=%d module=%s sha256=%s bytes=%d",
+            "gpu_collective_overlap_pass: POST-SHARE HASH rank=%d host=%s pid=%d module=%s sha256=%s bytes=%d",
             _rank, _host, _pid, _module_name, _digest, len(result_bytes),
         )
         sys.stderr.write(
-            f"[collective_overlap_pass] === BEGIN POST-SHARE MODULE "
+            f"[gpu_collective_overlap_pass] === BEGIN POST-SHARE MODULE "
             f"(rank={_rank} host={_host} pid={_pid} module={_module_name} "
             f"sha256={_digest}) ===\n"
             f"{_final_module.to_string()}\n"
-            f"[collective_overlap_pass] === END POST-SHARE MODULE "
+            f"[gpu_collective_overlap_pass] === END POST-SHARE MODULE "
             f"(rank={_rank} module={_module_name}) ===\n"
         )
 
     _logger.info(
-        "collective_overlap_pass: EXIT host=%s pid=%d result=%s (total %.1f ms).",
+        "gpu_collective_overlap_pass: EXIT host=%s pid=%d result=%s (total %.1f ms).",
         socket.gethostname(), os.getpid(),
         "no-op" if result_bytes is None else f"{len(result_bytes)} bytes",
         (time.monotonic() - _t_enter) * 1000,
@@ -2660,12 +2662,12 @@ def _patch_pgle_profiler() -> None:
             _te_ep_overrides.update(te_ep_costs)
             _profile_costs.update(te_ep_costs)
             _logger.info(
-                "collective_overlap_pass: captured live per-invocation corrections: %d te_ep, %d GEMM, %d collective.",
+                "gpu_collective_overlap_pass: captured live per-invocation corrections: %d te_ep, %d GEMM, %d collective.",
                 len(te_ep_costs), len(gemm_costs), len(coll_costs),
             )
         except Exception as exc:  # pylint: disable=broad-except
             _logger.warning(
-                "collective_overlap_pass: failed to extract per-invocation costs from live PGLE data: %s", exc,
+                "gpu_collective_overlap_pass: failed to extract per-invocation costs from live PGLE data: %s", exc,
             )
         return _original_get_fdo_profile(xspace)
 
@@ -2688,11 +2690,11 @@ def register() -> None:
     if _registered:
         return
     if os.environ.get("COLLECTIVE_OVERLAP_DISABLE", "1") == "1":
-        _logger.info("collective_overlap_pass: disabled (set COLLECTIVE_OVERLAP_DISABLE=0 to enable)")
+        _logger.info("gpu_collective_overlap_pass: disabled (set COLLECTIVE_OVERLAP_DISABLE=0 to enable)")
         return
     if not _XLA_SRC:
         _logger.warning(
-            "collective_overlap_pass: not registered; the XLA source path is needed to compile "
+            "gpu_collective_overlap_pass: not registered; the XLA source path is needed to compile "
             "the profile protos. Set COLLECTIVE_OVERLAP_XLA_PATH to an XLA checkout."
         )
         return
@@ -2700,9 +2702,9 @@ def register() -> None:
 
     _patch_pgle_profiler()
     jex_xla.register_hlo_module_transformation(
-        _collective_overlap_pass,
-        name="profile_guided_collective_overlap",
+        _gpu_collective_overlap_pass,
+        name="gpu_collective_overlap_pass",
         stage=jex_xla.PipelineStage.POST_SCHEDULER,
     )
     _registered = True
-    _logger.info("collective_overlap_pass: registered POST_SCHEDULER pass 'profile_guided_collective_overlap'.")
+    _logger.info("gpu_collective_overlap_pass: registered POST_SCHEDULER pass 'gpu_collective_overlap_pass'.")
