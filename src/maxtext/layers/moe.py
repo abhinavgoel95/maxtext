@@ -4924,6 +4924,7 @@ class RoutedMoE(nnx.Module):
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
         quant_before_fsdp_ag=self.config.te_moe_quantize_before_fsdp_all_gather,
+        use_cudnn_fusion=False,
         **checkpoint_kwargs,
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
