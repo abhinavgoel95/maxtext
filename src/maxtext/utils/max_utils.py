@@ -1281,6 +1281,54 @@ def get_te_moe_recv_capacity_per_rank():
   return _te_moe_bootstrap_signature[5]
 
 
+def maybe_init_mok_moe(config, mesh, shaped_batch):
+  """Create the Mixture-of-Kittens (mok-jax) cross-GPU workspace for the mok_moe_block path."""
+  if not getattr(config, "mok_moe_block", False):
+    return
+  import mokjax  # pylint: disable=import-outside-toplevel
+
+  ep_axis = "expert"
+  if ep_axis not in mesh.axis_names:
+    raise ValueError("mok_moe_block=True requires an 'expert' mesh axis.")
+  ep_size = mesh.shape[ep_axis]
+  if config.num_experts % ep_size != 0:
+    raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
+  loaded_batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  ga_steps = config.gradient_accumulation_steps
+  if ga_steps < 1 or loaded_batch_size % ga_steps != 0:
+    raise ValueError("MoK loaded batch must be divisible by positive GA steps.")
+
+  # GA microbatches execute sequentially and reuse the same workspace.
+  batch_size = max(
+      loaded_batch_size // ga_steps,
+      config.micro_batch_size_to_train_on,
+  )
+  if config.eval_interval > 0:
+    batch_size = max(batch_size, config.micro_batch_size_to_eval_on)
+
+  if (batch_size * sequence_length) % mesh.devices.size != 0:
+    raise ValueError("mok_moe_block=True requires tokens to be evenly sharded across all devices.")
+  tokens_per_device = batch_size * sequence_length // mesh.devices.size
+  hidden_dim = config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim
+  devices = np.moveaxis(np.asarray(mesh.devices), mesh.axis_names.index(ep_axis), -1).reshape(-1, ep_size)
+  mokjax.init(
+      num_local_tokens=tokens_per_device,
+      hidden=hidden_dim,
+      topk=config.num_experts_per_tok,
+      ep_groups=[list(g) for g in devices],
+      reserved_sms=config.mok_reserved_sms,
+  )
+  if config.mok_overlap_pass:
+    # green context: keep FSDP collectives in flight across MoK calls; collective stream: issue weight all-gathers
+    # before the MoK call they would otherwise queue behind
+    mokjax.enable_overlap_pass()
+    max_logging.log("mok-jax POST_SCHEDULER overlap pass registered")
+  max_logging.log(
+      f"mok-jax workspace ready: {tokens_per_device} tokens/device, hidden={hidden_dim}, "
+      f"top-k={config.num_experts_per_tok}, EP={ep_size}, {devices.shape[0]} EP groups"
+  )
+
+
 def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   """Eagerly initialize TransformerEngine NCCL EP for the fused MoEBlock path."""
   if not getattr(config, "te_moe_block", False):

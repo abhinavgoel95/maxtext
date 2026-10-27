@@ -317,6 +317,16 @@ use_ring_of_experts: false # whether to use ring of experts for sparse matmul ex
 moe_topk_before_ep_all_gather: false # ring of experts: run top-k on local tokens and all-gather top-k weights/ids instead of router logits
 te_moe_block: false # whether to use TransformerEngine's MoEBlock for routed MoE layers
 te_moe_quantize_before_fsdp_all_gather: false # true: quantize TE MoE weights before FSDP all-gather; false: quantize after
+mok_moe_block: false # fused routed + shared MoE via mokjax
+mok_fwd_comm_sms: 36
+mok_bwd_comm_sms: 36
+mok_minibatch_size: 8192 # tokens
+mok_macrobatch_mult: 32 # macrobatch = multiplier x minibatch
+mok_overlap_pass: false # optional mokjax scheduling pass; independent of TJ's pass
+mok_save_context: true
+mok_residuals: "inputs" # inputs: recompute context; context: use mok_ctx/mok_sched policies
+mok_quantize_before_fsdp_all_gather: false
+mok_reserved_sms: 0 # zero uses collective stream; positive enables green context
 te_ep_overflow_check_every_n_steps: 20 # host check interval for TE EP overflow when ragged_buffer_factor limits receive capacity
 te_gmm_quantization: "" # quantization mode for TE GMM matmuls; available options are te_no_quant and te_mxfp8; must be specified when te_moe_block is true
 # Whether to quantize token activations before the All-Gather across EP shards in Ring-of-Experts forward pass
@@ -519,6 +529,8 @@ moe_x_sorted: 'remat' # routed (expert-sorted) MoE input plus its routing metada
 moe_routing_maps: 'remat' # MoE routing maps (top-k expert ids, ragged-sort permutations, sorted token indices and group sizes); with moe_tc_window_routing, also the TC group sizes
 # TODO: Update to moe_tc_routing_weights.
 moe_tc_routing_checkpoint: 'remat' # TC per-buffer-row routing weights (moe_tc_ragged_sort with moe_tc_ragged_weights_on_activation)
+mok_ctx: 'remat'
+mok_sched: 'remat'
 query_proj: 'remat'
 key_proj: 'remat'
 value_proj: 'remat'

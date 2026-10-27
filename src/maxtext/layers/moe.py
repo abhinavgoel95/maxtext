@@ -5248,6 +5248,10 @@ class RoutedAndSharedMoE(nnx.Module):
       A tuple containing the combined MoE output (routed + shared),
       the load balance loss, and any routed bias updates.
     """
+    if self.config.mok_moe_block:
+      if gate_inputs is not None or input_ids is not None or forced_routed_experts is not None:
+        raise ValueError("mok_moe_block=True does not support gate_inputs, hash routing or forced routing.")
+      return self._mok_moe(inputs, out_sharding)
     routed_experts, load_balance_loss, moe_bias_updates = self.routed_moe(
         inputs,
         gate_inputs=gate_inputs,
@@ -5261,3 +5265,92 @@ class RoutedAndSharedMoE(nnx.Module):
         out_sharding=out_sharding,
     )
     return routed_experts + shared_experts, load_balance_loss, moe_bias_updates
+
+  def _mok_moe(self, inputs, out_sharding):
+    """Routed + shared experts in one Mixture-of-Kittens megakernel call per GPU (mok-jax).
+
+    Routing (gate, DeepSeek top-k, load-balance loss) is MaxText's own. Dispatch, routed experts (MXFP8), shared
+    expert (BF16), SwiGLU and combine run inside MoK. Each GPU's tokens stay on that GPU; EP peers are the devices
+    along the 'expert' mesh axis.
+    """
+    import mokjax  # pylint: disable=import-outside-toplevel
+
+    cfg = self.config
+    rm = self.routed_moe
+    if cfg.mlp_bias or rm.per_expert_scale is not None or len(cfg.mlp_activations) != 2:
+      raise ValueError("mok_moe_block=True supports gated SwiGLU experts without biases or per-expert scales.")
+    inputs = inputs.astype(cfg.dtype)
+    gate_logits, pre_bias_logits = rm.gate(inputs)
+    top_k_weights, top_k_indices = rm.get_topk(gate_logits, pre_bias_logits)
+    lb_loss = None
+    if cfg.load_balance_loss_weight > 0.0:
+      probs_logits = pre_bias_logits if pre_bias_logits is not None else gate_logits
+      softmax_probs = jax.nn.softmax(probs_logits.astype(jnp.float32), axis=-1).astype(rm.dtype)
+      lb_loss = rm.load_balance_loss(top_k_indices, softmax_probs)
+
+    if cfg.prefuse_moe_weights:
+      wi = jnp.asarray(rm.wi[...], rm.dtype)  # [E, H, 2I]: gate | up
+      n = wi.shape[-1] // 2
+      w_gate, w_up = wi[..., :n], wi[..., n:]
+    else:
+      w_gate, w_up = jnp.asarray(rm.wi_0[...], rm.dtype), jnp.asarray(rm.wi_1[...], rm.dtype)
+    w_down = jnp.asarray(rm.wo[...], rm.dtype)  # [E, I, H]
+    se = self.shared_experts
+    ws_gate = jnp.asarray(se.wi_0.kernel[...], cfg.dtype).T  # [I, H]
+    ws_up = jnp.asarray(se.wi_1.kernel[...], cfg.dtype).T  # [I, H]
+    ws_down = jnp.asarray(se.wo.kernel[...], cfg.dtype).T  # [H, I]
+
+    ep_axis = "expert"
+    tok_spec = rm._logical_to_mesh_axes(("activation_batch", "activation_norm_length", None))  # pylint: disable=protected-access
+    w_spec = P(ep_axis, None, None)
+    shard_axes = [a for d in tok_spec[:2] if d is not None for a in ((d,) if isinstance(d, str) else d)]
+    if math.prod(self.mesh.shape[a] for a in shard_axes) != self.mesh.devices.size or ep_axis not in shard_axes:
+      raise ValueError(f"mok_moe_block=True needs tokens sharded over every device incl. '{ep_axis}'; got {tok_spec}.")
+    rep = NamedSharding(self.mesh, P())
+    gather_axes, gather_size = (), 1
+    if cfg.mok_quantize_before_fsdp_all_gather:
+      # Keep the expert dim sharded as stored (EP rank-major, then FSDP); mok-jax quantizes each device's experts and
+      # all-gathers MXFP8 over the remaining axes (like TE's te_moe_quantize_before_fsdp_all_gather).
+      d0 = rm._logical_to_mesh_axes((rm.wi_kernel_axes[0],))[0]  # pylint: disable=protected-access
+      d0 = (d0,) if isinstance(d0, str) else tuple(d0 or ())
+      if not d0 or d0[0] != ep_axis:
+        raise ValueError(f"mok_quantize_before_fsdp_all_gather needs expert weights sharded ('{ep_axis}', ...); got {d0}.")
+      gather_axes = tuple(a for a in d0[1:] if self.mesh.shape[a] > 1)
+      gather_size = math.prod(self.mesh.shape[a] for a in gather_axes)
+      if gather_axes:
+        w_spec = P((ep_axis,) + gather_axes, None, None)
+    # Expert weights: whole experts per EP rank (all-gathers any FSDP sharding, as TE's EP boundary does), or with
+    # mok_quantize_before_fsdp_all_gather this device's slice of them.
+    w_gate, w_up, w_down = (jax.lax.with_sharding_constraint(w, NamedSharding(self.mesh, w_spec)) for w in (w_gate, w_up, w_down))
+    ws_gate, ws_up, ws_down = (jax.lax.with_sharding_constraint(w, rep) for w in (ws_gate, ws_up, ws_down))
+    mok_cfg = mokjax.Config(
+        fwd_num_comm_sms=cfg.mok_fwd_comm_sms,
+        bwd_num_comm_sms=cfg.mok_bwd_comm_sms,
+        minibatch_size=cfg.mok_minibatch_size,
+        macrobatch_size=cfg.mok_macrobatch_mult * cfg.mok_minibatch_size,
+        save_context=cfg.mok_save_context,
+        residuals=cfg.mok_residuals,
+        collective_stream=cfg.mok_reserved_sms <= 0,
+        gather_axes=gather_axes,
+        gather_size=gather_size,
+    )
+
+    def local(x, rw, top, sg, su, sd, wg, wu, wd):
+      b, s, h = x.shape
+      k = top.shape[-1]
+      y = mokjax.moe_maxtext_layout(
+          x.reshape(b * s, h), rw.reshape(b * s, k).astype(jnp.float32), top.reshape(b * s, k).astype(jnp.int32),
+          sg, su, sd, wg, wu, wd, config=mok_cfg)
+      return y.reshape(b, s, h)
+
+    output = jax.shard_map(
+        local,
+        mesh=self.mesh,
+        in_specs=(tok_spec, tok_spec, tok_spec, P(), P(), P(), w_spec, w_spec, w_spec),
+        out_specs=tok_spec,
+        check_vma=False,
+    )(inputs, top_k_weights, top_k_indices, ws_gate, ws_up, ws_down, w_gate, w_up, w_down)
+    output = output.astype(cfg.dtype)
+    if out_sharding is not None:
+      output = jax.lax.with_sharding_constraint(output, out_sharding)
+    return output, lb_loss, None

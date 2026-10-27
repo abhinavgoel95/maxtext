@@ -1314,6 +1314,16 @@ class MoEGeneral(BaseModel):
       False,
       description="Quantize TE MoE weight shards before the FSDP all-gather; false quantizes after gathering.",
   )
+  mok_moe_block: bool = Field(False, description="Fused routed + shared MoE via mokjax.")
+  mok_fwd_comm_sms: PositiveInt = Field(36, description="MoK forward communication SMs.")
+  mok_bwd_comm_sms: PositiveInt = Field(36, description="MoK backward communication SMs.")
+  mok_minibatch_size: PositiveInt = Field(8192, description="MoK minibatch tokens.")
+  mok_macrobatch_mult: PositiveInt = Field(32, description="MoK macrobatch multiplier.")
+  mok_overlap_pass: bool = Field(False, description="Register mokjax's optional scheduling pass.")
+  mok_save_context: bool = Field(True, description="Save MoK forward context.")
+  mok_residuals: str = Field("inputs", description="MoK residuals: inputs or context.")
+  mok_quantize_before_fsdp_all_gather: bool = Field(False, description="Gather MXFP8 expert weights.")
+  mok_reserved_sms: int = Field(0, description="Reserved NCCL SMs; zero uses the collective stream.")
   te_ep_overflow_check_every_n_steps: PositiveInt = Field(
       20,
       description=(
@@ -2201,6 +2211,8 @@ class RematAndOffload(BaseModel):
       RematLocation.REMAT,
       description="Remat policy for the second MoE layer's output.",
   )
+  mok_ctx: RematLocation = Field(RematLocation.REMAT, description="MoK forward context checkpoint policy.")
+  mok_sched: RematLocation = Field(RematLocation.REMAT, description="MoK dispatch schedule checkpoint policy.")
   query_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the query projection.")
   key_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the key projection.")
   value_proj: RematLocation = Field(RematLocation.REMAT, description="Remat policy for the value projection.")
@@ -5122,6 +5134,8 @@ class MaxTextConfig(
           "moe_mlpwi_1",
           "moe_mlpwo",
           "te_moe_dispatch_remat_location",
+          "mok_ctx",
+          "mok_sched",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",
@@ -5640,6 +5654,10 @@ class MaxTextConfig(
           and self.decoder_block not in (DecoderBlockType.DEEPSEEK, DecoderBlockType.DEEPSEEK4)
       ):
         raise ValueError("Loss-free load balancing is only supported for the DeepSeek decoder block.")
+      if self.mok_moe_block and self.te_moe_block:
+        raise ValueError("mok_moe_block and te_moe_block are mutually exclusive.")
+      if self.mok_moe_block and self.routed_bias_update_rate > 0.0:
+        raise ValueError("mok_moe_block=True does not support routed_bias_update_rate > 0.")
       if self.te_moe_block and not self.sparse_matmul:
         raise ValueError("te_moe_block=True requires sparse_matmul=True.")
       if self.te_moe_quantize_before_fsdp_all_gather:
@@ -6821,6 +6839,8 @@ class RLConfig(
           "moe_mlpwi_1",
           "moe_mlpwo",
           "te_moe_dispatch_remat_location",
+          "mok_ctx",
+          "mok_sched",
           "mlpwi_0",
           "mlpwi_1",
           "mlpwo",

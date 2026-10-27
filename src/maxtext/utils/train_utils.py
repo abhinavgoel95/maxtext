@@ -474,6 +474,7 @@ def setup_train_loop(config, recorder, devices=None, elastic_retry_cache=None):
 
     shaped_batch = maxtext_utils.get_shaped_batch(config)
     max_utils.maybe_bootstrap_te_moe(config, mesh, shaped_batch)
+    max_utils.maybe_init_mok_moe(config, mesh, shaped_batch)
 
     # In snapshot mode the retry cache carries the snapshotter across attempts; the state is restored from its
     # latest snapshot when that is at least as recent as the latest checkpoint.
