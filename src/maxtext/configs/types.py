@@ -1513,6 +1513,9 @@ class MoEGeneral(BaseModel):
       description="SparseCore ID to pin MoE EP all-gathers to when moe_pin_sparse_core_all_gathers is True.",
   )
   use_random_routing: bool = Field(False, description="Whether to use random routing for debugging.")
+  moe_router_force_load_balancing: bool = Field(
+      False, description="Benchmark-only random logits with straight-through gradients; does not prevent overflow."
+  )
   interleave_moe_layer_step: int = Field(1, description="Frequency of MoE layers, e.g., 2 means every 2nd layer is MoE.")
   moe_fsdp_use_two_stage_all_gather: bool = Field(
       False,
@@ -5905,6 +5908,15 @@ class MaxTextConfig(
         )
       if self.te_moe_block and self.use_random_routing:
         raise ValueError("te_moe_block=True does not support use_random_routing=True.")
+      if self.moe_router_force_load_balancing:
+        if self.use_random_routing:
+          raise ValueError("Force load balancing cannot be combined with use_random_routing.")
+        if self.load_balance_loss_weight != 0:
+          raise ValueError("Force load balancing requires load_balance_loss_weight=0.")
+        if self.routed_bias_update_rate != 0:
+          raise ValueError("Force load balancing requires routed_bias_update_rate=0.")
+        if self.moe_dropless_fallback is not None:
+          raise ValueError("Force load balancing does not yet support moe_dropless_fallback.")
       if self.te_moe_block and self.decoder_block == DecoderBlockType.LLAMA4:
         raise ValueError("te_moe_block=True does not currently support Llama4 routing semantics.")
       if self.te_moe_block and not self.te_gmm_quantization:

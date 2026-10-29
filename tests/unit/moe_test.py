@@ -49,6 +49,72 @@ from tests.utils import linen_wrappers
 import pytest
 
 
+class ForceLoadBalancingTest(unittest.TestCase):
+  """Random-logit routing preserves the learned router's backward path."""
+
+  def test_replacement_and_straight_through_gradient(self):
+    logits = jnp.ones((8, 16), jnp.float32)
+    noise = jax.random.normal(jax.random.key(0), logits.shape)
+    np.testing.assert_array_equal(moe._replace_router_logits(logits, noise), noise)
+    dlogits, dnoise = jax.grad(
+        lambda x, n: jnp.sum(moe._replace_router_logits(x, n) ** 2), argnums=(0, 1)
+    )(logits, noise)
+    np.testing.assert_array_equal(dlogits, 2 * noise)
+    np.testing.assert_array_equal(dnoise, jnp.zeros_like(noise))
+
+  def test_scan_remat_replays_routing(self):
+    keys = jax.random.split(jax.random.key(7), 3)
+    logits = jnp.ones((32, 16), jnp.float32)
+
+    def route(x, key):
+      noise = jax.random.normal(key, x.shape, x.dtype)
+      scores = jax.nn.softmax(moe._replace_router_logits(x, noise))
+      weights, indices = jax.lax.top_k(scores, 4)
+      return jnp.sum(weights ** 2), indices
+
+    def scan_loss(x, remat):
+      fn = jax.checkpoint(route) if remat else route
+      def body(carry, key):
+        loss, indices = fn(x, key)
+        return carry + loss, indices
+      return jax.lax.scan(body, jnp.float32(0), keys)
+
+    ordinary = jax.jit(jax.value_and_grad(lambda x: scan_loss(x, False), has_aux=True))(logits)
+    rematted = jax.jit(jax.value_and_grad(lambda x: scan_loss(x, True), has_aux=True))(logits)
+    # Routing must replay exactly; fused arithmetic in gradients can round differently.
+    np.testing.assert_array_equal(rematted[0][1], ordinary[0][1])
+    np.testing.assert_allclose(rematted[0][0], ordinary[0][0], rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(rematted[1], ordinary[1], rtol=1e-6, atol=1e-7)
+    indices = np.asarray(ordinary[0][1])
+    self.assertFalse(np.array_equal(indices[0], indices[1]))
+    self.assertTrue(np.all(np.diff(np.sort(indices, axis=-1), axis=-1) > 0))
+
+  def test_nnx_remat_rng_advances_once(self):
+    class Router(nnx.Module):
+      def __init__(self):
+        self.rngs = nnx.Rngs(params=7)
+        self.logits = nnx.Param(jnp.ones((32, 16), jnp.float32))
+
+    def loss(model):
+      noise = jax.random.normal(model.rngs.params(), model.logits[...].shape)
+      scores = moe._replace_router_logits(model.logits[...], noise)
+      return jnp.sum(scores ** 2), noise
+
+    plain, remat = Router(), Router()
+    ordinary = nnx.value_and_grad(loss, has_aux=True)
+    checkpointed = nnx.value_and_grad(nnx.remat(loss), has_aux=True)
+    first = None
+    for _ in range(2):
+      actual, expected = checkpointed(remat), ordinary(plain)
+      np.testing.assert_array_equal(actual[0][1], expected[0][1])
+      np.testing.assert_allclose(actual[1].logits[...], expected[1].logits[...])
+      self.assertEqual(int(remat.rngs.params.count[...]), int(plain.rngs.params.count[...]))
+      if first is None:
+        first = np.asarray(actual[0][1])
+      else:
+        self.assertFalse(np.array_equal(first, actual[0][1]))
+
+
 def compare_tree(a, b, relative_norm_diff_threshold=1e-02):
   """
   Compute the relative norm difference between two pytrees and enforce threshold.

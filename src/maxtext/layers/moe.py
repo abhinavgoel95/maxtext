@@ -628,6 +628,23 @@ class MoEBiasVar(nnx.Variable):
   """Custom NNX Variable for Auxiliary-Loss-Free MoE Routing Bias (DSV4)."""
 
 
+@jax.custom_vjp
+def _replace_router_logits(logits, noise):
+  """Use random forward values without disconnecting the learned router gradient."""
+  return noise
+
+
+def _replace_router_logits_fwd(logits, noise):
+  return noise, None
+
+
+def _replace_router_logits_bwd(_, cotangent):
+  return cotangent, None
+
+
+_replace_router_logits.defvjp(_replace_router_logits_fwd, _replace_router_logits_bwd)
+
+
 class GateLogit(nnx.Module):
   """A layer used to compute gate logits, allowing to return the pre bias values for DeepSeek routing."""
 
@@ -741,7 +758,9 @@ class GateLogit(nnx.Module):
       return None
     return getattr(self, self._quant_dot_general_name)
 
-  def __call__(self, inputs: jax.Array, _initializing: bool = False) -> Tuple[jax.Array, Optional[jax.Array]]:
+  def __call__(
+      self, inputs: jax.Array, _initializing: bool = False, *, routing_key: jax.Array | None = None
+  ) -> Tuple[jax.Array, Optional[jax.Array]]:
     inputs = jnp.asarray(inputs, self.dtype)
     norm_axis = linears.normalize_axes(self.axis, inputs.ndim)
 
@@ -769,6 +788,11 @@ class GateLogit(nnx.Module):
         out_sharding=output_sharding,
     )
     pre_bias_logits = None
+
+    if routing_key is not None:
+      # Replace raw logits, before score activation and selection-only expert bias.
+      noise = jax.random.normal(routing_key, output.shape, output.dtype)
+      output = _replace_router_logits(output, noise)
 
     if self.score_func:
       output = linears._convert_to_activation_function(self.score_func)(output)
@@ -5109,8 +5133,9 @@ class RoutedMoE(nnx.Module):
 
     if self.quant is None or not hasattr(self.quant, "get_moe_block_quantizer_sets"):
       raise ValueError("te_moe_block=True requires TransformerEngine quantization or te_gmm_quantization=te_no_quant.")
-    if self.is_hash_routing and (routing_indices is None or routing_weights is None):
-      raise ValueError("TE MoE hash routing requires precomputed routing indices and weights.")
+    external_routing = self.is_hash_routing or self.config.moe_router_force_load_balancing
+    if external_routing and (routing_indices is None or routing_weights is None):
+      raise ValueError("TE external routing requires precomputed routing indices and weights.")
 
     expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32) if self.use_gate_bias else None
 
@@ -5140,9 +5165,9 @@ class RoutedMoE(nnx.Module):
     # Older TE versions take the router arguments directly and do not return expert counts.
     supports_router_info = hasattr(te_moe, "RouterComputationInfo")
     if not supports_router_info:
-      if self.is_hash_routing:
+      if external_routing:
         raise ImportError(
-            "te_moe_block=True with hash routing requires TransformerEngine with "
+            "TE external routing requires TransformerEngine with "
             "moe.RoutingMapInfo support. Please upgrade TransformerEngine."
         )
       if self.should_update_load_balance():
@@ -5162,7 +5187,7 @@ class RoutedMoE(nnx.Module):
           "aux_loss_coeff": self.config.load_balance_loss_weight,
           "gate_kernel_axes": self.kernel_axes,
       }
-    elif self.is_hash_routing:
+    elif external_routing:
       router_kwargs = {
           "router_info": te_moe.RoutingMapInfo(
               routing_indices=routing_indices,
@@ -5269,11 +5294,20 @@ class RoutedMoE(nnx.Module):
     gate_dtype = jnp.float32 if cfg.float32_gate_logits else cfg.dtype
     routing_inputs = inputs if gate_inputs is None else gate_inputs.astype(gate_dtype)
 
+    if cfg.moe_router_force_load_balancing:
+      if self.is_hash_routing or forced_routed_experts is not None:
+        raise ValueError("Force load balancing requires learned top-k routing.")
+      if quantizations.in_serve_mode(self.quant):
+        raise ValueError("Force load balancing is a training benchmark option, not a serving option.")
+    # NNX carries this stream's state through training. Rematerialization must
+    # replay the same key; do not introduce host/rank-local RNG side effects.
+    routing_key = self.rngs.params() if cfg.moe_router_force_load_balancing else None
+
     if cfg.te_moe_block:
       routing_indices = None
       routing_weights = None
-      if self.is_hash_routing:
-        gate_logits, pre_bias_logits = self.gate(routing_inputs)
+      if self.is_hash_routing or cfg.moe_router_force_load_balancing:
+        gate_logits, pre_bias_logits = self.gate(routing_inputs, routing_key=routing_key)
         routing_weights, routing_indices = self.get_topk(
             gate_logits,
             pre_bias_logits,
@@ -5304,7 +5338,7 @@ class RoutedMoE(nnx.Module):
           out_sharding=out_sharding,
       )
 
-    gate_logits, pre_bias_logits = self.gate(routing_inputs)
+    gate_logits, pre_bias_logits = self.gate(routing_inputs, routing_key=routing_key)
 
     is_fused_moe_path = cfg.attention in ("vllm_rpa", "vllm_batched_rpa") and not self.is_hash_routing
 
